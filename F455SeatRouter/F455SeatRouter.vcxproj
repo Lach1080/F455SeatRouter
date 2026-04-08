@@ -74,10 +74,10 @@
       <AdditionalDependencies>winhttp.lib;rsid.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)sdk\lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
-    <!-- Copy config.json next to the exe after build -->
+    <!-- Copy config.json and SDK DLLs next to the exe after build -->
     <PostBuildEvent>
-      <Command>xcopy /Y /I "$(SolutionDir)config.json" "$(OutDir)"</Command>
-      <Message>Copying config.json to output directory</Message>
+      <Command>xcopy /Y /I "$(SolutionDir)config.json" "$(OutDir)" &amp;&amp; xcopy /Y /I "$(SolutionDir)sdk\bin\x64\Release\*.dll" "$(OutDir)"</Command>
+      <Message>Copying config.json and SDK DLLs to output directory</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
 
@@ -99,8 +99,8 @@
       <AdditionalLibraryDirectories>$(SolutionDir)sdk\lib\x64\Debug;$(SolutionDir)sdk\lib\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent>
-      <Command>xcopy /Y /I "$(SolutionDir)config.json" "$(OutDir)"</Command>
-      <Message>Copying config.json to output directory</Message>
+      <Command>xcopy /Y /I "$(SolutionDir)config.json" "$(OutDir)" &amp;&amp; xcopy /Y /I "$(SolutionDir)sdk\bin\x64\Release\*.dll" "$(OutDir)"</Command>
+      <Message>Copying config.json and SDK DLLs to output directory</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
 
