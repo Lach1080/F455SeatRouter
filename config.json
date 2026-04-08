@@ -1,0 +1,41 @@
+{
+  "port": "COM3",
+  "rotation": "Rotation_90_Deg",
+  "idle_timeout_s": 5,
+  "switch_delay_s": 15,
+  "auto_enrol_min_interval_s": 5,
+  "forbidden_causes_logout_when_locked": false,
+
+  "cms": {
+    "host": "10.16.0.12",
+    "port": 9001,
+    "path_players": "/ssb/v1/players",
+    "path_logins": "/ssb/v1/egm-logins",
+    "path_logouts": "/ssb/v1/egm-logouts",
+    "card_create_path_template": "/ssb/v1/players/%d/cards",
+    "ignore_cert_errors": true
+  },
+
+  "enrollment_defaults": {
+    "first_name": "Guest",
+    "last_name": "Guest",
+    "birth_date": "1980-09-10",
+    "address_line1": "12 Bay Lane",
+    "postal_code": "1001",
+    "country_code": "AU",
+    "player_pin": "1111"
+  },
+
+  "seats": [
+    { "seat_id": "seat_1", "enabled": true,  "x":    0, "y": 0, "width": 640, "height": 1080 },
+    { "seat_id": "seat_2", "enabled": false, "x":  640, "y": 0, "width": 640, "height": 1080 },
+    { "seat_id": "seat_3", "enabled": true,  "x": 1280, "y": 0, "width": 640, "height": 1080 },
+    { "seat_id": "seat_4", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 },
+    { "seat_id": "seat_5", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 }
+  ],
+
+  "routes": [
+    { "seat_id": "seat_1", "asset_id": "8003", "login_token_type": "assetId", "login_token_data": "8003" },
+    { "seat_id": "seat_3", "asset_id": "8004", "login_token_type": "assetId", "login_token_data": "8004" }
+  ]
+}

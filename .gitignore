@@ -1,0 +1,35 @@
+# Visual Studio build artifacts
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.aps
+*.suo
+*.ncb
+*.sdf
+*.opensdf
+ipch/
+
+# Compiled output
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.tlog
+*.idb
+*.ipdb
+*.iobj
+
+# Deployment output
+dist/
+
+# SDK binaries (too large for source control - copy manually per SETUP.md)
+sdk/bin/
+sdk/lib/
+
+# SDK headers can be committed if desired - currently excluded
+sdk/include/
+
+# Local overrides
+*.local.json
