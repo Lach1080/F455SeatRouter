@@ -136,14 +136,14 @@ AppConfig LoadAppConfig()
 {
     AppConfig cfg;
 
-    std::wstring exe_dir      = GetExeDir();
+    std::wstring exe_dir       = GetExeDir();
     std::wstring config_path_w = exe_dir + L"\\config.json";
-    std::string  config_path(config_path_w.begin(), config_path_w.end());
 
-    std::ifstream f(config_path);
+    // Open via wide path directly to avoid wchar_t->char narrowing
+    std::ifstream f(config_path_w);
     if (!f.is_open())
     {
-        std::printf("[CONFIG] WARNING: config.json not found at %s\n", config_path.c_str());
+        std::printf("[CONFIG] WARNING: config.json not found next to exe.\n");
         std::printf("[CONFIG] Using built-in defaults.\n");
         return cfg;
     }
@@ -241,6 +241,13 @@ struct SeatSession
 
     bool        pending_auto_enrol = false;
     std::chrono::steady_clock::time_point last_auto_enrol{};
+
+    // Two-phase enrolment:
+    //   Phase 1 (pending_auto_enrol)    → create SYNKROS player+card records
+    //   Phase 2 (pending_enrol_card_id) → enrol face on camera using stored cardId
+    // Keeping them separate prevents orphaned SYNKROS records when camera enrol fails/retries.
+    std::string pending_enrol_user_id;
+    std::string pending_enrol_card_id;  // non-empty = Phase 2 active
 };
 
 // One session per enabled seat_id
@@ -297,6 +304,37 @@ RealSenseID::DeviceConfig BuildDeviceConfig(const AppConfig& appCfg)
         cfg.detection_rois[i].width  = seat.width;
         cfg.detection_rois[i].height = seat.height;
         ++i;
+    }
+    return cfg;
+}
+
+// Builds a DeviceConfig restricted to a single seat's ROI.
+// Used during camera enrolment to prevent DuplicateFaceprints when
+// multiple patrons are in frame simultaneously.
+RealSenseID::DeviceConfig BuildSingleSeatDeviceConfig(const AppConfig& appCfg, const std::string& seat_id)
+{
+    RealSenseID::DeviceConfig cfg;
+    cfg.security_level           = RealSenseID::DeviceConfig::SecurityLevel::Low;
+    cfg.algo_flow                = RealSenseID::DeviceConfig::AlgoFlow::All;
+    cfg.face_selection_policy    = RealSenseID::DeviceConfig::FaceSelectionPolicy::Single;
+    cfg.rect_enable              = 0x01;
+    cfg.landmarks_enable         = 0;
+    cfg.camera_rotation          = appCfg.rotation;
+    cfg.matcher_confidence_level = RealSenseID::DeviceConfig::MatcherConfidenceLevel::Low;
+    cfg.frontal_face_policy      = RealSenseID::DeviceConfig::FrontalFacePolicy::None;
+    cfg.person_motion_mode       = RealSenseID::DeviceConfig::PersonMotionMode::Static;
+    cfg.distance_limit           = RealSenseID::DeviceConfig::DistanceLimit::NoLimit;
+    cfg.distance_enabled         = false;
+    cfg.num_rois                 = 1;
+
+    for (const auto& seat : appCfg.seats)
+    {
+        if (!seat.enabled || seat.seat_id != seat_id) continue;
+        cfg.detection_rois[0].x      = seat.x;
+        cfg.detection_rois[0].y      = seat.y;
+        cfg.detection_rois[0].width  = seat.width;
+        cfg.detection_rois[0].height = seat.height;
+        break;
     }
     return cfg;
 }
@@ -799,68 +837,123 @@ int main()
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
             }
 
-            // Collect pending auto-enrols across all seats
-            using SeatEnrol = std::pair<std::string, AssetRoute>; // seat_id, route
-            std::vector<SeatEnrol> pending_enrols;
-
+            // ── Phase 1: Create SYNKROS records for newly-pending seats ─────────
+            // Only runs when pending_auto_enrol is set and no CMS records exist yet.
+            // Separating this from camera enrolment prevents orphaned records on retry.
             {
-                std::lock_guard<std::mutex> lock(g_state_mtx);
-                auto now = std::chrono::steady_clock::now();
+                using SeatEnrol = std::pair<std::string, AssetRoute>;
+                std::vector<SeatEnrol> cms_pending;
 
-                for (auto& [seat_id, session] : g_seat_sessions)
                 {
-                    if (!session.pending_auto_enrol) continue;
-                    if (session.state != SessionState::Unlocked) continue;
+                    std::lock_guard<std::mutex> lock(g_state_mtx);
+                    auto now = std::chrono::steady_clock::now();
 
-                    // Per-seat throttle
-                    if (session.last_auto_enrol.time_since_epoch().count() != 0)
+                    for (auto& [seat_id, session] : g_seat_sessions)
                     {
-                        double since_s = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - session.last_auto_enrol).count() / 1000.0;
-                        if (since_s < appCfg.auto_enrol_min_interval_s)
+                        if (!session.pending_auto_enrol) continue;
+                        if (session.state != SessionState::Unlocked) continue;
+                        if (!session.pending_enrol_card_id.empty()) continue; // CMS already done
+
+                        // Per-seat throttle
+                        if (session.last_auto_enrol.time_since_epoch().count() != 0)
                         {
-                            std::printf("[MAIN][%s] Auto-enrol throttled (%.1fs ago)\n",
-                                seat_id.c_str(), since_s);
-                            session.pending_auto_enrol = false; // will re-arm on next Forbidden
-                            continue;
+                            double since_s = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - session.last_auto_enrol).count() / 1000.0;
+                            if (since_s < appCfg.auto_enrol_min_interval_s)
+                            {
+                                std::printf("[MAIN][%s] Auto-enrol throttled (%.1fs ago)\n",
+                                    seat_id.c_str(), since_s);
+                                session.pending_auto_enrol = false; // re-arm on next Forbidden
+                                continue;
+                            }
                         }
+
+                        auto route = FindRouteForSeat(appCfg, seat_id);
+                        if (!route.has_value()) { session.pending_auto_enrol = false; continue; }
+
+                        session.pending_auto_enrol = false;
+                        session.last_auto_enrol    = now;
+                        cms_pending.push_back({seat_id, *route});
                     }
+                }
 
-                    auto route = FindRouteForSeat(appCfg, seat_id);
-                    if (!route.has_value()) { session.pending_auto_enrol = false; continue; }
-
-                    session.pending_auto_enrol = false;
-                    session.last_auto_enrol    = now;
-                    pending_enrols.push_back({seat_id, *route});
+                for (auto& [seat_id, route] : cms_pending)
+                {
+                    std::printf("[MAIN][%s] Phase 1 — creating CMS records (asset=%s)\n",
+                        seat_id.c_str(), route.asset_id.c_str());
+                    NewPatronInfo info;
+                    if (egm_auto_enrol(appCfg, info))
+                    {
+                        std::lock_guard<std::mutex> lock(g_state_mtx);
+                        g_seat_sessions[seat_id].pending_enrol_user_id = info.user_id;
+                        g_seat_sessions[seat_id].pending_enrol_card_id = info.card_id;
+                        std::printf("[MAIN][%s] CMS done — cardId=%s. Camera enrol pending.\n",
+                            seat_id.c_str(), info.card_id.c_str());
+                    }
+                    else
+                    {
+                        std::printf("[MAIN][%s] Phase 1 FAILED (CMS) — will retry on next Forbidden\n",
+                            seat_id.c_str());
+                    }
                 }
             }
 
-            // Process enrols sequentially (camera enrol is blocking)
-            for (auto& [seat_id, route] : pending_enrols)
+            // ── Phase 2: Camera enrolment, one seat at a time ────────────────
+            // Temporarily restricts the camera to only the enrolling seat's ROI.
+            // This prevents DuplicateFaceprints when multiple patrons are in frame:
+            // the camera can only see (and enrol) the face in the target seat's zone.
+            // After enrolment, the full multi-seat config is restored.
             {
-                std::printf("[MAIN] Auto-enrol for seat=%s asset=%s\n",
-                    seat_id.c_str(), route.asset_id.c_str());
+                using SeatCamEnrol = std::tuple<std::string, std::string, std::string>;
+                std::vector<SeatCamEnrol> cam_pending;
 
-                NewPatronInfo info;
-                if (!egm_auto_enrol(appCfg, info))
                 {
-                    std::printf("[MAIN][%s] Auto-enrol FAILED (CMS)\n", seat_id.c_str());
-                    continue;
+                    std::lock_guard<std::mutex> lock(g_state_mtx);
+                    for (auto& [seat_id, session] : g_seat_sessions)
+                    {
+                        if (session.pending_enrol_card_id.empty()) continue;
+                        if (session.state != SessionState::Unlocked) continue;
+                        cam_pending.emplace_back(seat_id,
+                            session.pending_enrol_user_id,
+                            session.pending_enrol_card_id);
+                    }
                 }
 
-                SimpleEnrolCallback enrolCb;
-                std::printf("[MAIN][%s] Camera enrol for cardId=%s\n",
-                    seat_id.c_str(), info.card_id.c_str());
+                for (auto& [seat_id, user_id, card_id] : cam_pending)
+                {
+                    std::printf("[MAIN][%s] Phase 2 — camera enrol for cardId=%s\n",
+                        seat_id.c_str(), card_id.c_str());
 
-                auto est = auth.Enroll(enrolCb, info.user_id.c_str());
-                std::printf("[MAIN][%s] Enroll() Status=%d\n", seat_id.c_str(), (int)est);
+                    // Restrict to this seat's ROI only — prevents grabbing already-enrolled face
+                    auto single_cfg = BuildSingleSeatDeviceConfig(appCfg, seat_id);
+                    auto sc_st = auth.SetDeviceConfig(single_cfg);
+                    std::printf("[MAIN][%s] SetDeviceConfig (single-seat) status=%d\n",
+                        seat_id.c_str(), (int)sc_st);
 
-                if (est == Status::Ok)
-                    std::printf("[MAIN][%s] Enrol succeeded — re-present face to log in.\n",
-                        seat_id.c_str());
-                else
-                    std::printf("[MAIN][%s] Camera enrol failed — patron must try again.\n",
-                        seat_id.c_str());
+                    SimpleEnrolCallback enrolCb;
+                    auto est = auth.Enroll(enrolCb, user_id.c_str());
+                    std::printf("[MAIN][%s] Enroll() Status=%d\n", seat_id.c_str(), (int)est);
+
+                    // Always restore full multi-seat config after enrolment attempt
+                    auto full_cfg = BuildDeviceConfig(appCfg);
+                    auth.SetDeviceConfig(full_cfg);
+
+                    if (est == Status::Ok)
+                    {
+                        std::lock_guard<std::mutex> lock(g_state_mtx);
+                        g_seat_sessions[seat_id].pending_enrol_card_id.clear();
+                        g_seat_sessions[seat_id].pending_enrol_user_id.clear();
+                        std::printf("[MAIN][%s] Enrol succeeded — patron must re-present face to log in.\n",
+                            seat_id.c_str());
+                    }
+                    else
+                    {
+                        // CMS records are preserved (pending_enrol_card_id stays set).
+                        // Camera enrol will be retried next cycle without creating new SYNKROS records.
+                        std::printf("[MAIN][%s] Camera enrol failed (Status=%d) — retrying next cycle\n",
+                            seat_id.c_str(), (int)est);
+                    }
+                }
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
