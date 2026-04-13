@@ -1,4 +1,4 @@
-// main.cpp
+// main.cpp  —  v2.0  multi-seat concurrent sessions
 // Multi-ROI, seat-aware RealSense -> SYNKROS CMS bridge with auto-enrol
 //
 // IMPORTANT:
@@ -7,6 +7,12 @@
 // 3) Uses repeated Authenticate() calls, not AuthenticateLoop()
 // 4) All runtime config is read from config.json next to the executable.
 //    Edit config.json - do NOT hard-code values here.
+//
+// v2.0 change: per-seat concurrent session management.
+//   Each enabled seat/ROI has its own independent SessionState.
+//   OnFaceDetected records the resolved seat for each face index.
+//   OnResult matches each result to the face at the same index,
+//   allowing simultaneous login/logout/enrol on different seats.
 
 #include <RealSenseID/FaceAuthenticator.h>
 #include <RealSenseID/AuthenticationCallback.h>
@@ -25,13 +31,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // ============================================================
@@ -50,21 +56,21 @@ struct SeatConfig
 
 struct AssetRoute
 {
-    std::string seat_id;           // seat resolved from ROI logic
-    std::string asset_id;          // used for logout payload
-    std::string login_token_type;  // e.g. "assetId"
-    std::string login_token_data;  // e.g. "8003"
+    std::string seat_id;
+    std::string asset_id;
+    std::string login_token_type;
+    std::string login_token_data;
 };
 
 struct CmsConfig
 {
-    std::wstring  host                     = L"10.16.0.12";
-    INTERNET_PORT port                     = 9001;
-    std::wstring  path_players             = L"/ssb/v1/players";
-    std::wstring  path_logins              = L"/ssb/v1/egm-logins";
-    std::wstring  path_logouts             = L"/ssb/v1/egm-logouts";
+    std::wstring  host                      = L"10.16.0.12";
+    INTERNET_PORT port                      = 9001;
+    std::wstring  path_players              = L"/ssb/v1/players";
+    std::wstring  path_logins               = L"/ssb/v1/egm-logins";
+    std::wstring  path_logouts              = L"/ssb/v1/egm-logouts";
     std::string   card_create_path_template = "/ssb/v1/players/%d/cards";
-    bool          ignore_cert_errors       = true;
+    bool          ignore_cert_errors        = true;
 };
 
 struct EnrollmentDefaults
@@ -84,9 +90,9 @@ struct AppConfig
     RealSenseID::DeviceConfig::CameraRotation rotation =
         RealSenseID::DeviceConfig::CameraRotation::Rotation_90_Deg;
 
-    int  idle_timeout_s              = 5;
-    int  switch_delay_s              = 15;
-    int  auto_enrol_min_interval_s   = 5;
+    int  idle_timeout_s                      = 5;
+    int  switch_delay_s                      = 15;
+    int  auto_enrol_min_interval_s           = 5;
     bool forbidden_causes_logout_when_locked = false;
 
     CmsConfig           cms;
@@ -96,7 +102,7 @@ struct AppConfig
 };
 
 // ============================================================
-// CONFIG LOADING  (reads config.json next to the .exe)
+// CONFIG LOADING
 // ============================================================
 
 static std::wstring GetExeDir()
@@ -123,15 +129,14 @@ static RealSenseID::DeviceConfig::CameraRotation ParseRotation(const std::string
     if (s == "Rotation_0_Deg")   return R::Rotation_0_Deg;
     if (s == "Rotation_180_Deg") return R::Rotation_180_Deg;
     if (s == "Rotation_270_Deg") return R::Rotation_270_Deg;
-    return R::Rotation_90_Deg; // default
+    return R::Rotation_90_Deg;
 }
 
 AppConfig LoadAppConfig()
 {
-    AppConfig cfg; // populated with defaults above
+    AppConfig cfg;
 
-    // Locate config.json next to the executable
-    std::wstring exe_dir = GetExeDir();
+    std::wstring exe_dir      = GetExeDir();
     std::wstring config_path_w = exe_dir + L"\\config.json";
     std::string  config_path(config_path_w.begin(), config_path_w.end());
 
@@ -139,53 +144,33 @@ AppConfig LoadAppConfig()
     if (!f.is_open())
     {
         std::printf("[CONFIG] WARNING: config.json not found at %s\n", config_path.c_str());
-        std::printf("[CONFIG] Using built-in defaults. Copy config.json next to the exe.\n");
+        std::printf("[CONFIG] Using built-in defaults.\n");
         return cfg;
     }
 
     try
     {
-        auto j = nlohmann::json::parse(f, nullptr, /*exceptions=*/true, /*ignore_comments=*/true);
+        auto j = nlohmann::json::parse(f, nullptr, true, true);
 
-        if (j.contains("port"))
-            cfg.port = j["port"].get<std::string>();
+        if (j.contains("port"))                              cfg.port = j["port"].get<std::string>();
+        if (j.contains("rotation"))                         cfg.rotation = ParseRotation(j["rotation"].get<std::string>());
+        if (j.contains("idle_timeout_s"))                   cfg.idle_timeout_s = j["idle_timeout_s"].get<int>();
+        if (j.contains("switch_delay_s"))                   cfg.switch_delay_s = j["switch_delay_s"].get<int>();
+        if (j.contains("auto_enrol_min_interval_s"))        cfg.auto_enrol_min_interval_s = j["auto_enrol_min_interval_s"].get<int>();
+        if (j.contains("forbidden_causes_logout_when_locked")) cfg.forbidden_causes_logout_when_locked = j["forbidden_causes_logout_when_locked"].get<bool>();
 
-        if (j.contains("rotation"))
-            cfg.rotation = ParseRotation(j["rotation"].get<std::string>());
-
-        if (j.contains("idle_timeout_s"))
-            cfg.idle_timeout_s = j["idle_timeout_s"].get<int>();
-
-        if (j.contains("switch_delay_s"))
-            cfg.switch_delay_s = j["switch_delay_s"].get<int>();
-
-        if (j.contains("auto_enrol_min_interval_s"))
-            cfg.auto_enrol_min_interval_s = j["auto_enrol_min_interval_s"].get<int>();
-
-        if (j.contains("forbidden_causes_logout_when_locked"))
-            cfg.forbidden_causes_logout_when_locked = j["forbidden_causes_logout_when_locked"].get<bool>();
-
-        // CMS
         if (j.contains("cms"))
         {
             auto& jc = j["cms"];
-            if (jc.contains("host"))
-                cfg.cms.host = Utf8ToWide(jc["host"].get<std::string>());
-            if (jc.contains("port"))
-                cfg.cms.port = static_cast<INTERNET_PORT>(jc["port"].get<int>());
-            if (jc.contains("path_players"))
-                cfg.cms.path_players = Utf8ToWide(jc["path_players"].get<std::string>());
-            if (jc.contains("path_logins"))
-                cfg.cms.path_logins = Utf8ToWide(jc["path_logins"].get<std::string>());
-            if (jc.contains("path_logouts"))
-                cfg.cms.path_logouts = Utf8ToWide(jc["path_logouts"].get<std::string>());
-            if (jc.contains("card_create_path_template"))
-                cfg.cms.card_create_path_template = jc["card_create_path_template"].get<std::string>();
-            if (jc.contains("ignore_cert_errors"))
-                cfg.cms.ignore_cert_errors = jc["ignore_cert_errors"].get<bool>();
+            if (jc.contains("host"))                      cfg.cms.host = Utf8ToWide(jc["host"].get<std::string>());
+            if (jc.contains("port"))                      cfg.cms.port = static_cast<INTERNET_PORT>(jc["port"].get<int>());
+            if (jc.contains("path_players"))              cfg.cms.path_players = Utf8ToWide(jc["path_players"].get<std::string>());
+            if (jc.contains("path_logins"))               cfg.cms.path_logins = Utf8ToWide(jc["path_logins"].get<std::string>());
+            if (jc.contains("path_logouts"))              cfg.cms.path_logouts = Utf8ToWide(jc["path_logouts"].get<std::string>());
+            if (jc.contains("card_create_path_template")) cfg.cms.card_create_path_template = jc["card_create_path_template"].get<std::string>();
+            if (jc.contains("ignore_cert_errors"))        cfg.cms.ignore_cert_errors = jc["ignore_cert_errors"].get<bool>();
         }
 
-        // Enrollment defaults
         if (j.contains("enrollment_defaults"))
         {
             auto& je = j["enrollment_defaults"];
@@ -198,7 +183,6 @@ AppConfig LoadAppConfig()
             if (je.contains("player_pin"))    cfg.enrol_defaults.player_pin    = je["player_pin"].get<std::string>();
         }
 
-        // Seats
         if (j.contains("seats") && j["seats"].is_array())
         {
             for (const auto& js : j["seats"])
@@ -214,7 +198,6 @@ AppConfig LoadAppConfig()
             }
         }
 
-        // Routes
         if (j.contains("routes") && j["routes"].is_array())
         {
             for (const auto& jr : j["routes"])
@@ -240,32 +223,30 @@ AppConfig LoadAppConfig()
 }
 
 // ============================================================
-// GLOBAL STATE
+// PER-SEAT SESSION STATE
 // ============================================================
 
 enum class SessionState { Unlocked, LockedToUser, Cooldown };
 
-struct AutoEnrolState
+struct SeatSession
 {
     SessionState state = SessionState::Unlocked;
 
-    std::string  current_user_id;
-    std::string  current_card_id;
-    std::string  current_seat_id;
-    AssetRoute   current_route{};
+    std::string current_user_id;
+    std::string current_card_id;
+    AssetRoute  current_route{};
 
     std::chrono::steady_clock::time_point last_seen_owner{};
     std::chrono::steady_clock::time_point cooldown_until{};
 
-    bool       pending_auto_enrol = false;
-    std::string pending_seat_id;
-    AssetRoute  pending_route{};
+    bool        pending_auto_enrol = false;
+    std::chrono::steady_clock::time_point last_auto_enrol{};
 };
 
-AutoEnrolState            g_state;
-std::mutex                g_state_mtx;
-std::atomic<bool>         g_running{true};
-std::chrono::steady_clock::time_point g_last_auto_enrol{};
+// One session per enabled seat_id
+std::unordered_map<std::string, SeatSession> g_seat_sessions;
+std::mutex        g_state_mtx;
+std::atomic<bool> g_running{true};
 
 // ============================================================
 // HELPERS
@@ -273,86 +254,72 @@ std::chrono::steady_clock::time_point g_last_auto_enrol{};
 
 size_t CountEnabledSeats(const AppConfig& cfg)
 {
-    size_t count = 0;
-    for (const auto& seat : cfg.seats)
-        if (seat.enabled) ++count;
-    return count;
+    size_t n = 0;
+    for (const auto& s : cfg.seats) if (s.enabled) ++n;
+    return n;
 }
 
 std::optional<AssetRoute> FindRouteForSeat(const AppConfig& cfg, const std::string& seat_id)
 {
-    for (const auto& route : cfg.routes)
-        if (route.seat_id == seat_id) return route;
+    for (const auto& r : cfg.routes)
+        if (r.seat_id == seat_id) return r;
     return std::nullopt;
 }
 
 RealSenseID::DeviceConfig BuildDeviceConfig(const AppConfig& appCfg)
 {
-    const size_t enabled_count = CountEnabledSeats(appCfg);
-
-    if (enabled_count < 1)
-        throw std::runtime_error("At least one seat/ROI must be enabled in config.json.");
-    if (enabled_count > RealSenseID::DeviceConfig::MAX_ROIS)
-        throw std::runtime_error("Too many enabled seats in config.json. MAX_ROIS is 5.");
+    const size_t n = CountEnabledSeats(appCfg);
+    if (n < 1) throw std::runtime_error("At least one seat must be enabled in config.json.");
+    if (n > RealSenseID::DeviceConfig::MAX_ROIS) throw std::runtime_error("Too many enabled seats. MAX_ROIS is 5.");
 
     RealSenseID::DeviceConfig cfg;
-    cfg.security_level       = RealSenseID::DeviceConfig::SecurityLevel::Low;
-    cfg.algo_flow            = RealSenseID::DeviceConfig::AlgoFlow::All;
-    cfg.face_selection_policy = (enabled_count > 1)
+    cfg.security_level        = RealSenseID::DeviceConfig::SecurityLevel::Low;
+    cfg.algo_flow             = RealSenseID::DeviceConfig::AlgoFlow::All;
+    cfg.face_selection_policy = (n > 1)
         ? RealSenseID::DeviceConfig::FaceSelectionPolicy::All
         : RealSenseID::DeviceConfig::FaceSelectionPolicy::Single;
-    cfg.rect_enable          = 0x01;
-    cfg.landmarks_enable     = 0;
-    cfg.camera_rotation      = appCfg.rotation;
+    cfg.rect_enable           = 0x01;
+    cfg.landmarks_enable      = 0;
+    cfg.camera_rotation       = appCfg.rotation;
     cfg.matcher_confidence_level = RealSenseID::DeviceConfig::MatcherConfidenceLevel::Low;
-    cfg.frontal_face_policy  = RealSenseID::DeviceConfig::FrontalFacePolicy::None;
-    cfg.person_motion_mode   = RealSenseID::DeviceConfig::PersonMotionMode::Static;
-    cfg.distance_limit       = RealSenseID::DeviceConfig::DistanceLimit::NoLimit;
-    cfg.distance_enabled     = false;
-    cfg.num_rois             = static_cast<unsigned char>(enabled_count);
+    cfg.frontal_face_policy   = RealSenseID::DeviceConfig::FrontalFacePolicy::None;
+    cfg.person_motion_mode    = RealSenseID::DeviceConfig::PersonMotionMode::Static;
+    cfg.distance_limit        = RealSenseID::DeviceConfig::DistanceLimit::NoLimit;
+    cfg.distance_enabled      = false;
+    cfg.num_rois              = static_cast<unsigned char>(n);
 
-    size_t roi_index = 0;
+    size_t i = 0;
     for (const auto& seat : appCfg.seats)
     {
         if (!seat.enabled) continue;
-        cfg.detection_rois[roi_index].x      = seat.x;
-        cfg.detection_rois[roi_index].y      = seat.y;
-        cfg.detection_rois[roi_index].width  = seat.width;
-        cfg.detection_rois[roi_index].height = seat.height;
-        ++roi_index;
+        cfg.detection_rois[i].x      = seat.x;
+        cfg.detection_rois[i].y      = seat.y;
+        cfg.detection_rois[i].width  = seat.width;
+        cfg.detection_rois[i].height = seat.height;
+        ++i;
     }
-
     return cfg;
 }
 
-std::optional<std::string> ResolveSeatForFace(const RealSenseID::FaceRect& face, const AppConfig& appCfg)
+std::optional<std::string> ResolveSeatForFace(const RealSenseID::FaceRect& face, const AppConfig& cfg)
 {
-    const int face_center_x = face.x + (face.w / 2);
-    const int face_center_y = face.y + (face.h / 2);
+    const int cx = face.x + face.w / 2;
+    const int cy = face.y + face.h / 2;
 
-    std::optional<std::string> matched_seat;
-
-    for (const auto& seat : appCfg.seats)
+    std::optional<std::string> match;
+    for (const auto& seat : cfg.seats)
     {
         if (!seat.enabled) continue;
-
-        const int roi_left   = static_cast<int>(seat.x);
-        const int roi_right  = static_cast<int>(seat.x) + static_cast<int>(seat.width);
-        const int roi_top    = static_cast<int>(seat.y);
-        const int roi_bottom = static_cast<int>(seat.y) + static_cast<int>(seat.height);
-
         const bool inside =
-            (face_center_x >= roi_left  && face_center_x < roi_right) &&
-            (face_center_y >= roi_top   && face_center_y < roi_bottom);
-
+            (cx >= seat.x && cx < seat.x + seat.width) &&
+            (cy >= seat.y && cy < seat.y + seat.height);
         if (inside)
         {
-            if (matched_seat.has_value()) return std::nullopt; // ambiguous
-            matched_seat = seat.seat_id;
+            if (match.has_value()) return std::nullopt; // ambiguous
+            match = seat.seat_id;
         }
     }
-
-    return matched_seat;
+    return match;
 }
 
 // ============================================================
@@ -370,14 +337,12 @@ bool init_http(const CmsConfig& cms)
 
     if (!g_http_session)
     {
-        g_http_session = WinHttpOpen(
-            L"F455SeatRouter/1.0",
+        g_http_session = WinHttpOpen(L"F455SeatRouter/2.0",
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-
         if (!g_http_session)
         {
-            std::printf("[HTTP] ERROR: WinHttpOpen failed (err=%lu)\n", GetLastError());
+            std::printf("[HTTP] WinHttpOpen failed (err=%lu)\n", GetLastError());
             return false;
         }
     }
@@ -387,13 +352,12 @@ bool init_http(const CmsConfig& cms)
         g_http_connect = WinHttpConnect(g_http_session, cms.host.c_str(), cms.port, 0);
         if (!g_http_connect)
         {
-            std::printf("[HTTP] ERROR: WinHttpConnect failed (err=%lu)\n", GetLastError());
+            std::printf("[HTTP] WinHttpConnect failed (err=%lu)\n", GetLastError());
             WinHttpCloseHandle(g_http_session);
             g_http_session = nullptr;
             return false;
         }
     }
-
     return true;
 }
 
@@ -403,21 +367,17 @@ HttpResponse http_post_json(const CmsConfig& cms, const wchar_t* path, const std
 {
     using namespace std::chrono;
     HttpResponse result;
-
-    if (!init_http(cms)) { std::printf("[HTTP] ERROR: init_http() failed.\n"); return result; }
+    if (!init_http(cms)) { std::printf("[HTTP] init_http() failed.\n"); return result; }
 
     auto t_start = steady_clock::now();
     HINTERNET h_request = nullptr;
 
     {
         std::lock_guard<std::mutex> lock(g_http_mtx);
-        BOOL bRet = FALSE;
         LPCWSTR headers = L"Content-Type: application/json\r\n";
 
-        h_request = WinHttpOpenRequest(
-            g_http_connect, L"POST", path, nullptr,
+        h_request = WinHttpOpenRequest(g_http_connect, L"POST", path, nullptr,
             WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-
         if (!h_request) goto cleanup;
 
         if (cms.ignore_cert_errors)
@@ -429,62 +389,55 @@ HttpResponse http_post_json(const CmsConfig& cms, const wchar_t* path, const std
             WinHttpSetOption(h_request, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
         }
 
-        bRet = WinHttpSendRequest(h_request, headers, -1L,
+        if (!WinHttpSendRequest(h_request, headers, -1L,
             json_body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)json_body.data(),
-            (DWORD)json_body.size(), (DWORD)json_body.size(), 0);
-        if (!bRet) goto cleanup;
+            (DWORD)json_body.size(), (DWORD)json_body.size(), 0)) goto cleanup;
 
-        bRet = WinHttpReceiveResponse(h_request, nullptr);
-        if (!bRet) goto cleanup;
+        if (!WinHttpReceiveResponse(h_request, nullptr)) goto cleanup;
 
         {
-            DWORD status_code = 0, status_size = sizeof(status_code);
-            bRet = WinHttpQueryHeaders(h_request,
+            DWORD sc = 0, sc_sz = sizeof(sc);
+            if (!WinHttpQueryHeaders(h_request,
                 WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
-                WINHTTP_NO_HEADER_INDEX);
-            if (!bRet) goto cleanup;
-            result.status = (int)status_code;
+                WINHTTP_HEADER_NAME_BY_INDEX, &sc, &sc_sz, WINHTTP_NO_HEADER_INDEX)) goto cleanup;
+            result.status = (int)sc;
         }
 
         {
             std::string body;
-            DWORD dw_size = 0;
             for (;;)
             {
-                dw_size = 0;
-                if (!WinHttpQueryDataAvailable(h_request, &dw_size)) break;
-                if (dw_size == 0) break;
-                std::vector<char> buffer(dw_size);
-                DWORD dw_read = 0;
-                if (!WinHttpReadData(h_request, buffer.data(), dw_size, &dw_read)) break;
-                if (dw_read == 0) break;
-                body.append(buffer.data(), dw_read);
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(h_request, &avail) || avail == 0) break;
+                std::vector<char> buf(avail);
+                DWORD read = 0;
+                if (!WinHttpReadData(h_request, buf.data(), avail, &read) || read == 0) break;
+                body.append(buf.data(), read);
             }
             result.body = std::move(body);
         }
 
     cleanup:
-        if (h_request) { WinHttpCloseHandle(h_request); h_request = nullptr; }
+        if (h_request) { WinHttpCloseHandle(h_request); }
     }
 
     auto ms = duration_cast<milliseconds>(steady_clock::now() - t_start).count();
-    std::printf("[HTTP] POST %ls took %.1f ms (status=%d)\n", path, (double)ms, result.status);
+    std::printf("[HTTP] POST %ls  %ldms  status=%d\n", path, (long)ms, result.status);
     result.ok = (result.status != 0);
     return result;
 }
 
-int extract_int_field(const std::string& body, const std::string& field_name)
+int extract_int_field(const std::string& body, const std::string& field)
 {
-    std::string key = "\"" + field_name + "\":";
+    std::string key = "\"" + field + "\":";
     auto pos = body.find(key);
     if (pos == std::string::npos) return 0;
     pos += key.size();
     while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) ++pos;
-    bool any = false; int value = 0;
+    int v = 0; bool any = false;
     while (pos < body.size() && body[pos] >= '0' && body[pos] <= '9')
-    { any = true; value = value * 10 + (body[pos] - '0'); ++pos; }
-    return any ? value : 0;
+        { any = true; v = v * 10 + (body[pos++] - '0'); }
+    return any ? v : 0;
 }
 
 // ============================================================
@@ -500,9 +453,9 @@ bool egm_login(const CmsConfig& cms, const AssetRoute& route, const std::string&
         "\",\"loginTokenType\":\"" + route.login_token_type +
         "\",\"loginTokenData\":\"" + route.login_token_data + "\"}";
 
-    std::wprintf(L"[EGM] LOGIN  POST https://%ls:%d%ls\n", cms.host.c_str(), (int)cms.port, cms.path_logins.c_str());
-    std::printf("[EGM] LOGIN  payload = %s\n", payload.c_str());
-    HttpResponse resp = http_post_json(cms, cms.path_logins.c_str(), payload);
+    std::wprintf(L"[EGM] LOGIN  %ls:%d%ls\n", cms.host.c_str(), (int)cms.port, cms.path_logins.c_str());
+    std::printf("[EGM] LOGIN  payload=%s\n", payload.c_str());
+    auto resp = http_post_json(cms, cms.path_logins.c_str(), payload);
     std::printf("[EGM] LOGIN  status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(), 300), resp.body.c_str());
     return resp.ok && resp.status >= 200 && resp.status < 300;
@@ -514,30 +467,17 @@ bool egm_logout(const CmsConfig& cms, const AssetRoute& route, const std::string
         "{\"cardId\":\"" + card_id +
         "\",\"assetId\":\"" + route.asset_id + "\"}";
 
-    std::wprintf(L"[EGM] LOGOUT POST https://%ls:%d%ls\n", cms.host.c_str(), (int)cms.port, cms.path_logouts.c_str());
-    std::printf("[EGM] LOGOUT payload = %s\n", payload.c_str());
-    HttpResponse resp = http_post_json(cms, cms.path_logouts.c_str(), payload);
+    std::wprintf(L"[EGM] LOGOUT %ls:%d%ls\n", cms.host.c_str(), (int)cms.port, cms.path_logouts.c_str());
+    std::printf("[EGM] LOGOUT payload=%s\n", payload.c_str());
+    auto resp = http_post_json(cms, cms.path_logouts.c_str(), payload);
     std::printf("[EGM] LOGOUT status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(), 300), resp.body.c_str());
     return resp.ok && resp.status >= 200 && resp.status < 300;
 }
 
-bool egm_auto_enrol(const AppConfig& cfg, NewPatronInfo& out_info)
+// Note: throttle is handled per-seat in main() — not here.
+bool egm_auto_enrol(const AppConfig& cfg, NewPatronInfo& out)
 {
-    using namespace std::chrono;
-
-    auto now = steady_clock::now();
-    if (g_last_auto_enrol.time_since_epoch().count() != 0)
-    {
-        double since_last = duration_cast<milliseconds>(now - g_last_auto_enrol).count() / 1000.0;
-        if (since_last < cfg.auto_enrol_min_interval_s)
-        {
-            std::printf("[EGM] AUTO-ENROL: Skipping; last attempt %.2fs ago.\n", since_last);
-            return false;
-        }
-    }
-    g_last_auto_enrol = now;
-
     std::string player_payload =
         "{\"firstName\":\"" + cfg.enrol_defaults.first_name +
         "\",\"lastName\":\"" + cfg.enrol_defaults.last_name +
@@ -546,36 +486,37 @@ bool egm_auto_enrol(const AppConfig& cfg, NewPatronInfo& out_info)
         "\",\"postalCode\":\"" + cfg.enrol_defaults.postal_code +
         "\",\"countryCode\":\"" + cfg.enrol_defaults.country_code + "\"}}";
 
-    std::wprintf(L"[EGM] AUTO-ENROL: POST https://%ls:%d%ls\n", cfg.cms.host.c_str(), (int)cfg.cms.port, cfg.cms.path_players.c_str());
-    HttpResponse player_resp = http_post_json(cfg.cms, cfg.cms.path_players.c_str(), player_payload);
-    std::printf("[EGM] AUTO-ENROL: /players status=%d body=%.*s\n", player_resp.status,
-        (int)std::min<size_t>(player_resp.body.size(), 300), player_resp.body.c_str());
+    std::wprintf(L"[EGM] AUTO-ENROL: POST %ls\n", cfg.cms.path_players.c_str());
+    auto pr = http_post_json(cfg.cms, cfg.cms.path_players.c_str(), player_payload);
+    std::printf("[EGM] AUTO-ENROL: /players status=%d body=%.*s\n", pr.status,
+        (int)std::min<size_t>(pr.body.size(), 300), pr.body.c_str());
 
-    if (!player_resp.ok || player_resp.status < 200 || player_resp.status >= 300)
-    { std::printf("[EGM] AUTO-ENROL ERROR: /players call failed.\n"); return false; }
+    if (!pr.ok || pr.status < 200 || pr.status >= 300)
+        { std::printf("[EGM] AUTO-ENROL ERROR: /players failed.\n"); return false; }
 
-    int player_id = extract_int_field(player_resp.body, "playerId");
-    if (player_id <= 0) { std::printf("[EGM] AUTO-ENROL ERROR: Could not parse playerId.\n"); return false; }
+    int player_id = extract_int_field(pr.body, "playerId");
+    if (player_id <= 0)
+        { std::printf("[EGM] AUTO-ENROL ERROR: could not parse playerId.\n"); return false; }
 
     char path_buf[256];
     std::snprintf(path_buf, sizeof(path_buf), cfg.cms.card_create_path_template.c_str(), player_id);
     std::wstring card_path_w = Utf8ToWide(path_buf);
 
     std::string card_payload = "{\"playerPin\":\"" + cfg.enrol_defaults.player_pin + "\"}";
-    HttpResponse card_resp = http_post_json(cfg.cms, card_path_w.c_str(), card_payload);
-    std::printf("[EGM] AUTO-ENROL: /cards status=%d body=%.*s\n", card_resp.status,
-        (int)std::min<size_t>(card_resp.body.size(), 300), card_resp.body.c_str());
+    auto cr = http_post_json(cfg.cms, card_path_w.c_str(), card_payload);
+    std::printf("[EGM] AUTO-ENROL: /cards status=%d body=%.*s\n", cr.status,
+        (int)std::min<size_t>(cr.body.size(), 300), cr.body.c_str());
 
-    if (!card_resp.ok || card_resp.status < 200 || card_resp.status >= 300)
-    { std::printf("[EGM] AUTO-ENROL ERROR: /cards call failed.\n"); return false; }
+    if (!cr.ok || cr.status < 200 || cr.status >= 300)
+        { std::printf("[EGM] AUTO-ENROL ERROR: /cards failed.\n"); return false; }
 
-    int card_id = extract_int_field(card_resp.body, "cardId");
-    if (card_id <= 0) { std::printf("[EGM] AUTO-ENROL ERROR: Could not parse cardId.\n"); return false; }
+    int card_id = extract_int_field(cr.body, "cardId");
+    if (card_id <= 0)
+        { std::printf("[EGM] AUTO-ENROL ERROR: could not parse cardId.\n"); return false; }
 
-    out_info.card_id = std::to_string(card_id);
-    out_info.user_id = out_info.card_id; // camera user_id == CMS cardId for auto-enrolled patrons
-    std::printf("[EGM] AUTO-ENROL SUCCESS: playerId=%d cardId=%d camera_user_id=%s\n",
-        player_id, card_id, out_info.user_id.c_str());
+    out.card_id = std::to_string(card_id);
+    out.user_id = out.card_id;
+    std::printf("[EGM] AUTO-ENROL SUCCESS: playerId=%d cardId=%d\n", player_id, card_id);
     return true;
 }
 
@@ -587,13 +528,13 @@ class SimpleEnrolCallback : public RealSenseID::EnrollmentCallback
 {
 public:
     void OnResult(RealSenseID::EnrollStatus status) override
-    { std::printf("[ENROL] OnResult: status=%d\n", (int)status); }
+    { std::printf("[ENROL] OnResult: %d\n", (int)status); }
 
     void OnProgress(RealSenseID::FacePose pose) override
     { std::printf("[ENROL] OnProgress: pose=%d\n", (int)pose); }
 
-    void OnHint(RealSenseID::EnrollStatus hint, float faceCoverage) override
-    { std::printf("[ENROL] OnHint: hint=%d faceCoverage=%.2f\n", (int)hint, (double)faceCoverage); }
+    void OnHint(RealSenseID::EnrollStatus hint, float cov) override
+    { std::printf("[ENROL] OnHint: %d cov=%.2f\n", (int)hint, (double)cov); }
 };
 
 class AutoEnrolAuthCallback : public RealSenseID::AuthenticationCallback
@@ -601,163 +542,148 @@ class AutoEnrolAuthCallback : public RealSenseID::AuthenticationCallback
 public:
     explicit AutoEnrolAuthCallback(const AppConfig& cfg) : _cfg(cfg) {}
 
-    void OnResult(RealSenseID::AuthenticateStatus status, const char* user_id, short score) override
+    // Called once per Authenticate() with all detected faces.
+    // Stores the resolved seat for each face in order — OnResult fires in the same order.
+    void OnFaceDetected(const std::vector<RealSenseID::FaceRect>& faces,
+                        const unsigned int timestamp) override
+    {
+        std::lock_guard<std::mutex> lk(_face_mtx);
+        _result_index = 0;
+        _face_seats.clear();
+
+        std::printf("[FACE] faces=%zu timestamp=%u\n", faces.size(), timestamp);
+        for (size_t i = 0; i < faces.size(); ++i)
+        {
+            const auto& f = faces[i];
+            auto seat = ResolveSeatForFace(f, _cfg);
+            std::printf("  Face %zu x=%d y=%d w=%d h=%d center=(%d,%d) -> %s\n",
+                i, f.x, f.y, f.w, f.h, f.x + f.w / 2, f.y + f.h / 2,
+                seat.has_value() ? seat->c_str() : "none/ambiguous");
+            _face_seats.push_back(seat);
+        }
+    }
+
+    // Called once per recognised/rejected face, in the same order as OnFaceDetected.
+    void OnResult(RealSenseID::AuthenticateStatus status,
+                  const char* user_id, short score) override
     {
         using namespace std::chrono;
         using RealSenseID::AuthenticateStatus;
 
         const std::string uid = user_id ? user_id : "";
 
+        // Match this result to its face via index
         std::optional<std::string> resolved_seat;
-        size_t face_count = 0;
         {
-            std::lock_guard<std::mutex> lock(_face_mtx);
-            resolved_seat = _last_resolved_seat;
-            face_count    = _last_face_count;
+            std::lock_guard<std::mutex> lk(_face_mtx);
+            if (_result_index < _face_seats.size())
+                resolved_seat = _face_seats[_result_index];
+            ++_result_index;
         }
 
-        std::printf("[AUTH] OnResult: status=%d user_id=%s score=%d", (int)status, uid.c_str(), (int)score);
-        if (face_count == 1 && resolved_seat.has_value())
-            std::printf(" seat=%s", resolved_seat->c_str());
-        else if (face_count > 1)
-            std::printf(" seat=<multiple faces>");
-        else
-            std::printf(" seat=<none>");
-        std::printf("\n");
+        std::printf("[AUTH] OnResult[%zu]: status=%d user_id=%s score=%d seat=%s\n",
+            _result_index - 1, (int)status, uid.c_str(), (int)score,
+            resolved_seat.has_value() ? resolved_seat->c_str() : "<none>");
 
-        auto now = steady_clock::now();
-        std::lock_guard<std::mutex> state_lock(g_state_mtx);
+        if (!resolved_seat.has_value())
+        {
+            std::printf("[AUTH] No resolved seat for result %zu — ignored\n", _result_index - 1);
+            return;
+        }
 
         const bool is_success  = (status == AuthenticateStatus::Success);
         const bool is_forbidden = (status == AuthenticateStatus::Forbidden);
+        if (!is_success && !is_forbidden) return; // NoFaceDetected etc.
 
-        // LOCKED
-        if (g_state.state == SessionState::LockedToUser && !g_state.current_card_id.empty())
+        auto route_opt = FindRouteForSeat(_cfg, *resolved_seat);
+        if (!route_opt.has_value())
         {
-            if (is_success && uid == g_state.current_user_id)
+            std::printf("[AUTH] No route for seat %s — ignored\n", resolved_seat->c_str());
+            return;
+        }
+
+        auto now = steady_clock::now();
+        std::lock_guard<std::mutex> state_lock(g_state_mtx);
+        auto& session = g_seat_sessions[*resolved_seat];
+
+        // ── LOCKED ──────────────────────────────────────────────────────────
+        if (session.state == SessionState::LockedToUser)
+        {
+            if (is_success && uid == session.current_user_id)
             {
-                g_state.last_seen_owner = now;
-                std::printf("[SESSION] Owner %s re-confirmed on seat %s\n", uid.c_str(), g_state.current_seat_id.c_str());
+                session.last_seen_owner = now;
+                std::printf("[SESSION][%s] Owner %s re-confirmed\n",
+                    resolved_seat->c_str(), uid.c_str());
                 return;
             }
-            if (is_success && uid != g_state.current_user_id)
+            if (is_success)
             {
-                std::printf("[SESSION] Other user %s seen while locked to %s - ignored\n", uid.c_str(), g_state.current_user_id.c_str());
+                std::printf("[SESSION][%s] Other user %s seen while locked to %s — ignored\n",
+                    resolved_seat->c_str(), uid.c_str(), session.current_user_id.c_str());
                 return;
             }
             if (is_forbidden)
             {
-                std::printf("[SESSION] Forbidden while locked - %s\n",
-                    _cfg.forbidden_causes_logout_when_locked ? "policy logout (not yet implemented)" : "ignored");
+                std::printf("[SESSION][%s] Forbidden while locked — ignored\n", resolved_seat->c_str());
                 return;
             }
             return;
         }
 
-        // COOLDOWN
-        if (g_state.state == SessionState::Cooldown)
+        // ── COOLDOWN ─────────────────────────────────────────────────────────
+        if (session.state == SessionState::Cooldown)
         {
-            if (is_success || is_forbidden)
-                std::printf("[SESSION] In cooldown - ignoring auth result\n");
+            std::printf("[SESSION][%s] In cooldown — ignored\n", resolved_seat->c_str());
             return;
         }
 
-        // UNLOCKED + Success
+        // ── UNLOCKED + Success ───────────────────────────────────────────────
         if (is_success)
         {
-            if (face_count != 1 || !resolved_seat.has_value())
-            {
-                std::printf("[SESSION] Success but no single resolved seat - ignored\n");
-                return;
-            }
-            auto route = FindRouteForSeat(_cfg, *resolved_seat);
-            if (!route.has_value())
-            {
-                std::printf("[SESSION] No route for seat %s\n", resolved_seat->c_str());
-                return;
-            }
+            session.current_user_id = uid;
+            session.current_card_id = uid; // camera user_id == CMS cardId for auto-enrolled patrons
+            session.current_route   = *route_opt;
+            session.last_seen_owner = now;
+            session.state           = SessionState::LockedToUser;
 
-            g_state.current_user_id  = uid;
-            g_state.current_card_id  = uid; // camera user_id == cardId for auto-enrolled patrons
-            g_state.current_seat_id  = *resolved_seat;
-            g_state.current_route    = *route;
-            g_state.last_seen_owner  = now;
-            g_state.state            = SessionState::LockedToUser;
+            std::string  card_id = session.current_card_id;
+            AssetRoute   route   = session.current_route;
+            CmsConfig    cms     = _cfg.cms;
 
-            std::string   card_id      = g_state.current_card_id;
-            AssetRoute    current_route = g_state.current_route;
-            CmsConfig     cms_copy     = _cfg.cms;
+            std::printf("[SESSION][%s] Locked: user=%s cardId=%s asset=%s\n",
+                resolved_seat->c_str(), uid.c_str(), card_id.c_str(), route.asset_id.c_str());
 
-            std::printf("[SESSION] Locked: user=%s cardId=%s seat=%s asset=%s\n",
-                uid.c_str(), card_id.c_str(), g_state.current_seat_id.c_str(), current_route.asset_id.c_str());
-
-            std::thread([cms_copy, current_route, card_id]()
-                { egm_login(cms_copy, current_route, card_id); }).detach();
+            std::thread([cms, route, card_id]()
+                { egm_login(cms, route, card_id); }).detach();
             return;
         }
 
-        // UNLOCKED + Forbidden -> pending auto-enrol
+        // ── UNLOCKED + Forbidden → queue auto-enrol ──────────────────────────
         if (is_forbidden)
         {
-            if (face_count != 1 || !resolved_seat.has_value())
-            {
-                std::printf("[SESSION] Forbidden but no single resolved seat - not auto-enrolling\n");
-                return;
-            }
-            auto route = FindRouteForSeat(_cfg, *resolved_seat);
-            if (!route.has_value())
-            {
-                std::printf("[SESSION] Forbidden on seat %s but no route - not auto-enrolling\n", resolved_seat->c_str());
-                return;
-            }
-
-            g_state.pending_auto_enrol = true;
-            g_state.pending_seat_id    = *resolved_seat;
-            g_state.pending_route      = *route;
-            std::printf("[SESSION] Forbidden on seat=%s asset=%s -> pending auto-enrol\n",
-                g_state.pending_seat_id.c_str(), g_state.pending_route.asset_id.c_str());
+            session.pending_auto_enrol = true;
+            std::printf("[SESSION][%s] Forbidden → pending auto-enrol\n", resolved_seat->c_str());
         }
     }
 
     void OnHint(RealSenseID::AuthenticateStatus hint, float frameScore) override
-    { std::printf("[AUTH] OnHint: hint=%d frameScore=%.2f\n", (int)hint, (double)frameScore); }
-
-    void OnFaceDetected(const std::vector<RealSenseID::FaceRect>& faces, const unsigned int timestamp) override
-    {
-        std::lock_guard<std::mutex> lock(_face_mtx);
-        _last_face_count = faces.size();
-        _last_resolved_seat.reset();
-
-        std::printf("[FACE] faces=%zu timestamp=%u\n", faces.size(), timestamp);
-        if (faces.empty()) return;
-
-        for (size_t i = 0; i < faces.size(); ++i)
-        {
-            const auto& f = faces[i];
-            auto seat = ResolveSeatForFace(f, _cfg);
-            std::printf("  Face %zu x=%d y=%d w=%d h=%d center=(%d,%d) -> %s\n",
-                i, f.x, f.y, f.w, f.h,
-                f.x + f.w / 2, f.y + f.h / 2,
-                seat.has_value() ? seat->c_str() : "none/ambiguous");
-            if (faces.size() == 1) _last_resolved_seat = seat;
-        }
-    }
+    { std::printf("[AUTH] OnHint: %d frameScore=%.2f\n", (int)hint, (double)frameScore); }
 
 private:
     const AppConfig& _cfg;
-    std::mutex _face_mtx;
-    size_t _last_face_count = 0;
-    std::optional<std::string> _last_resolved_seat;
+    std::mutex       _face_mtx;
+    std::vector<std::optional<std::string>> _face_seats; // index = face order from OnFaceDetected
+    size_t           _result_index = 0;
 };
 
 // ============================================================
-// IDLE MONITOR
+// IDLE MONITOR  — checks every seat independently
 // ============================================================
 
 void idle_monitor(const AppConfig& cfg)
 {
     using namespace std::chrono;
-    std::printf("[BG] Idle monitor started: owner timeout=%ds cooldown=%ds\n",
+    std::printf("[BG] Idle monitor started: timeout=%ds cooldown=%ds\n",
         cfg.idle_timeout_s, cfg.switch_delay_s);
 
     while (g_running)
@@ -766,34 +692,37 @@ void idle_monitor(const AppConfig& cfg)
             std::lock_guard<std::mutex> lock(g_state_mtx);
             auto now = steady_clock::now();
 
-            if (g_state.state == SessionState::LockedToUser && !g_state.current_card_id.empty())
+            for (auto& [seat_id, session] : g_seat_sessions)
             {
-                auto elapsed = duration_cast<seconds>(now - g_state.last_seen_owner).count();
-                if (elapsed >= cfg.idle_timeout_s)
+                if (session.state == SessionState::LockedToUser &&
+                    !session.current_card_id.empty())
                 {
-                    std::string card_id = g_state.current_card_id;
-                    AssetRoute  route   = g_state.current_route;
-                    std::printf("[BG] Idle timeout - logout cardId=%s seat=%s asset=%s\n",
-                        card_id.c_str(), g_state.current_seat_id.c_str(), route.asset_id.c_str());
+                    auto elapsed = duration_cast<seconds>(now - session.last_seen_owner).count();
+                    if (elapsed >= cfg.idle_timeout_s)
+                    {
+                        std::string card_id = session.current_card_id;
+                        AssetRoute  route   = session.current_route;
+                        std::printf("[BG][%s] Idle timeout — logout cardId=%s asset=%s\n",
+                            seat_id.c_str(), card_id.c_str(), route.asset_id.c_str());
 
-                    g_state.state = SessionState::Cooldown;
-                    g_state.cooldown_until = now + seconds(cfg.switch_delay_s);
-                    g_state.current_user_id.clear();
-                    g_state.current_card_id.clear();
-                    g_state.current_seat_id.clear();
+                        session.state = SessionState::Cooldown;
+                        session.cooldown_until = now + seconds(cfg.switch_delay_s);
+                        session.current_user_id.clear();
+                        session.current_card_id.clear();
 
-                    std::thread([cms = cfg.cms, route, card_id]()
-                        { egm_logout(cms, route, card_id); }).detach();
+                        std::thread([cms = cfg.cms, route, card_id]()
+                            { egm_logout(cms, route, card_id); }).detach();
+                    }
+                }
+
+                if (session.state == SessionState::Cooldown && now >= session.cooldown_until)
+                {
+                    std::printf("[BG][%s] Cooldown finished — Unlocked\n", seat_id.c_str());
+                    session.state = SessionState::Unlocked;
                 }
             }
-
-            if (g_state.state == SessionState::Cooldown && now >= g_state.cooldown_until)
-            {
-                std::printf("[BG] Cooldown finished - returning to Unlocked\n");
-                g_state.state = SessionState::Unlocked;
-            }
         }
-        std::this_thread::sleep_for(milliseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 }
 
@@ -810,7 +739,7 @@ int main()
         AppConfig appCfg = LoadAppConfig();
 
         const size_t enabled_count = CountEnabledSeats(appCfg);
-        std::printf("=== F455 Seat-Aware Auto-Enrol (F455SeatRouter) ===\n");
+        std::printf("=== F455SeatRouter v2.0 (multi-seat concurrent) ===\n");
         std::printf("Enabled seats = %zu  |  Port = %s\n", enabled_count, appCfg.port.c_str());
 
         for (const auto& seat : appCfg.seats)
@@ -823,13 +752,20 @@ int main()
                 route.seat_id.c_str(), route.asset_id.c_str(),
                 route.login_token_type.c_str(), route.login_token_data.c_str());
 
+        // Initialise per-seat sessions
+        {
+            std::lock_guard<std::mutex> lock(g_state_mtx);
+            for (const auto& seat : appCfg.seats)
+                if (seat.enabled)
+                    g_seat_sessions[seat.seat_id] = SeatSession{};
+        }
+
         FaceAuthenticator     auth;
         AutoEnrolAuthCallback authCb(appCfg);
 
         std::printf("Connecting to camera on %s...\n", appCfg.port.c_str());
         auto st = auth.Connect({appCfg.port.c_str()});
         std::printf("Connect status = %d\n", (int)st);
-
         if (st != Status::Ok)
         {
             std::printf("ERROR: Failed to connect to camera.\n");
@@ -850,9 +786,7 @@ int main()
         std::thread idleThread(idle_monitor, std::cref(appCfg));
 
         std::printf("Running. Close window or stop debugging to exit.\n");
-        std::printf("  Unlocked + Success          -> CMS login for resolved seat\n");
-        std::printf("  Idle timeout                -> CMS logout + cooldown\n");
-        std::printf("  Unlocked + Forbidden + seat -> pending auto-enrol\n");
+        std::printf("  Each seat is tracked independently and concurrently.\n");
 
         while (g_running)
         {
@@ -865,45 +799,68 @@ int main()
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
             }
 
-            bool       do_auto_enrol = false;
-            std::string pending_seat;
-            AssetRoute  pending_route{};
+            // Collect pending auto-enrols across all seats
+            using SeatEnrol = std::pair<std::string, AssetRoute>; // seat_id, route
+            std::vector<SeatEnrol> pending_enrols;
 
             {
                 std::lock_guard<std::mutex> lock(g_state_mtx);
-                if (g_state.pending_auto_enrol && g_state.state == SessionState::Unlocked)
+                auto now = std::chrono::steady_clock::now();
+
+                for (auto& [seat_id, session] : g_seat_sessions)
                 {
-                    g_state.pending_auto_enrol = false;
-                    do_auto_enrol  = true;
-                    pending_seat   = g_state.pending_seat_id;
-                    pending_route  = g_state.pending_route;
+                    if (!session.pending_auto_enrol) continue;
+                    if (session.state != SessionState::Unlocked) continue;
+
+                    // Per-seat throttle
+                    if (session.last_auto_enrol.time_since_epoch().count() != 0)
+                    {
+                        double since_s = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - session.last_auto_enrol).count() / 1000.0;
+                        if (since_s < appCfg.auto_enrol_min_interval_s)
+                        {
+                            std::printf("[MAIN][%s] Auto-enrol throttled (%.1fs ago)\n",
+                                seat_id.c_str(), since_s);
+                            session.pending_auto_enrol = false; // will re-arm on next Forbidden
+                            continue;
+                        }
+                    }
+
+                    auto route = FindRouteForSeat(appCfg, seat_id);
+                    if (!route.has_value()) { session.pending_auto_enrol = false; continue; }
+
+                    session.pending_auto_enrol = false;
+                    session.last_auto_enrol    = now;
+                    pending_enrols.push_back({seat_id, *route});
                 }
             }
 
-            if (do_auto_enrol)
+            // Process enrols sequentially (camera enrol is blocking)
+            for (auto& [seat_id, route] : pending_enrols)
             {
-                std::printf("[MAIN] Running auto-enrol for seat=%s asset=%s\n",
-                    pending_seat.c_str(), pending_route.asset_id.c_str());
+                std::printf("[MAIN] Auto-enrol for seat=%s asset=%s\n",
+                    seat_id.c_str(), route.asset_id.c_str());
 
                 NewPatronInfo info;
                 if (!egm_auto_enrol(appCfg, info))
                 {
-                    std::printf("[MAIN] Auto-enrol FAILED (CMS). Patron must try again.\n");
+                    std::printf("[MAIN][%s] Auto-enrol FAILED (CMS)\n", seat_id.c_str());
+                    continue;
                 }
+
+                SimpleEnrolCallback enrolCb;
+                std::printf("[MAIN][%s] Camera enrol for cardId=%s\n",
+                    seat_id.c_str(), info.card_id.c_str());
+
+                auto est = auth.Enroll(enrolCb, info.user_id.c_str());
+                std::printf("[MAIN][%s] Enroll() Status=%d\n", seat_id.c_str(), (int)est);
+
+                if (est == Status::Ok)
+                    std::printf("[MAIN][%s] Enrol succeeded — re-present face to log in.\n",
+                        seat_id.c_str());
                 else
-                {
-                    SimpleEnrolCallback enrolCb;
-                    std::printf("[MAIN] Camera enrol for cardId=%s seat=%s\n",
-                        info.card_id.c_str(), pending_seat.c_str());
-
-                    auto est = auth.Enroll(enrolCb, info.user_id.c_str());
-                    std::printf("[MAIN] Enroll() returned Status=%d\n", (int)est);
-
-                    if (est != Status::Ok)
-                        std::printf("[MAIN] Camera enrol failed; patron must try again.\n");
-                    else
-                        std::printf("[MAIN] Camera enrol succeeded. Re-present face to log in.\n");
-                }
+                    std::printf("[MAIN][%s] Camera enrol failed — patron must try again.\n",
+                        seat_id.c_str());
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
