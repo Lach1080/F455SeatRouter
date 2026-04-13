@@ -95,6 +95,9 @@ struct AppConfig
     int  auto_enrol_min_interval_s           = 5;
     bool forbidden_causes_logout_when_locked = false;
 
+    RealSenseID::DeviceConfig::DumpMode dump_mode =
+        RealSenseID::DeviceConfig::DumpMode::None;
+
     CmsConfig           cms;
     EnrollmentDefaults  enrol_defaults;
     std::vector<SeatConfig>  seats;
@@ -121,6 +124,15 @@ static std::wstring Utf8ToWide(const std::string& s)
     std::wstring out(len, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &out[0], len);
     return out;
+}
+
+static RealSenseID::DeviceConfig::DumpMode ParseDumpMode(const std::string& s)
+{
+    using D = RealSenseID::DeviceConfig::DumpMode;
+    if (s == "CroppedFace") return D::CroppedFace;
+    if (s == "FullFrame")   return D::FullFrame;
+    if (s == "Debug")       return D::Debug;
+    return D::None;
 }
 
 static RealSenseID::DeviceConfig::CameraRotation ParseRotation(const std::string& s)
@@ -153,7 +165,8 @@ AppConfig LoadAppConfig()
         auto j = nlohmann::json::parse(f, nullptr, true, true);
 
         if (j.contains("port"))                              cfg.port = j["port"].get<std::string>();
-        if (j.contains("rotation"))                         cfg.rotation = ParseRotation(j["rotation"].get<std::string>());
+        if (j.contains("rotation"))                         cfg.rotation  = ParseRotation(j["rotation"].get<std::string>());
+        if (j.contains("DumpMode"))                         cfg.dump_mode = ParseDumpMode(j["DumpMode"].get<std::string>());
         if (j.contains("idle_timeout_s"))                   cfg.idle_timeout_s = j["idle_timeout_s"].get<int>();
         if (j.contains("switch_delay_s"))                   cfg.switch_delay_s = j["switch_delay_s"].get<int>();
         if (j.contains("auto_enrol_min_interval_s"))        cfg.auto_enrol_min_interval_s = j["auto_enrol_min_interval_s"].get<int>();
@@ -288,6 +301,7 @@ RealSenseID::DeviceConfig BuildDeviceConfig(const AppConfig& appCfg)
     cfg.rect_enable           = 0x01;
     cfg.landmarks_enable      = 0;
     cfg.camera_rotation       = appCfg.rotation;
+    cfg.dump_mode             = appCfg.dump_mode;
     cfg.matcher_confidence_level = RealSenseID::DeviceConfig::MatcherConfidenceLevel::Low;
     cfg.frontal_face_policy   = RealSenseID::DeviceConfig::FrontalFacePolicy::None;
     cfg.person_motion_mode    = RealSenseID::DeviceConfig::PersonMotionMode::Static;
@@ -320,6 +334,7 @@ RealSenseID::DeviceConfig BuildSingleSeatDeviceConfig(const AppConfig& appCfg, c
     cfg.rect_enable              = 0x01;
     cfg.landmarks_enable         = 0;
     cfg.camera_rotation          = appCfg.rotation;
+    cfg.dump_mode                = appCfg.dump_mode;
     cfg.matcher_confidence_level = RealSenseID::DeviceConfig::MatcherConfidenceLevel::Low;
     cfg.frontal_face_policy      = RealSenseID::DeviceConfig::FrontalFacePolicy::None;
     cfg.person_motion_mode       = RealSenseID::DeviceConfig::PersonMotionMode::Static;
