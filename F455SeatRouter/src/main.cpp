@@ -480,6 +480,68 @@ HttpResponse http_post_json(const CmsConfig& cms, const wchar_t* path, const std
     return result;
 }
 
+HttpResponse http_get_json(const CmsConfig& cms, const wchar_t* path)
+{
+    using namespace std::chrono;
+    HttpResponse result;
+    if (!init_http(cms)) { std::printf("[HTTP] init_http() failed.\n"); return result; }
+
+    auto t_start = steady_clock::now();
+    HINTERNET h_request = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(g_http_mtx);
+
+        h_request = WinHttpOpenRequest(g_http_connect, L"GET", path, nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!h_request) goto cleanup_get;
+
+        if (cms.ignore_cert_errors)
+        {
+            DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                          SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(h_request, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+        }
+
+        if (!WinHttpSendRequest(h_request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) goto cleanup_get;
+
+        if (!WinHttpReceiveResponse(h_request, nullptr)) goto cleanup_get;
+
+        {
+            DWORD sc = 0, sc_sz = sizeof(sc);
+            if (!WinHttpQueryHeaders(h_request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &sc, &sc_sz, WINHTTP_NO_HEADER_INDEX)) goto cleanup_get;
+            result.status = (int)sc;
+        }
+
+        {
+            std::string body;
+            for (;;)
+            {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(h_request, &avail) || avail == 0) break;
+                std::vector<char> buf(avail);
+                DWORD read = 0;
+                if (!WinHttpReadData(h_request, buf.data(), avail, &read) || read == 0) break;
+                body.append(buf.data(), read);
+            }
+            result.body = std::move(body);
+        }
+
+    cleanup_get:
+        if (h_request) { WinHttpCloseHandle(h_request); }
+    }
+
+    auto ms = duration_cast<milliseconds>(steady_clock::now() - t_start).count();
+    std::printf("[HTTP] GET  %ls  %ldms  status=%d\n", path, (long)ms, result.status);
+    result.ok = (result.status != 0);
+    return result;
+}
+
 int extract_int_field(const std::string& body, const std::string& field)
 {
     std::string key = "\"" + field + "\":";
@@ -568,9 +630,66 @@ bool egm_auto_enrol(const AppConfig& cfg, NewPatronInfo& out)
         { std::printf("[EGM] AUTO-ENROL ERROR: could not parse cardId.\n"); return false; }
 
     out.card_id = std::to_string(card_id);
-    out.user_id = out.card_id;
+    out.user_id = std::to_string(player_id); // store playerId on camera — not cardId
     std::printf("[EGM] AUTO-ENROL SUCCESS: playerId=%d cardId=%d\n", player_id, card_id);
     return true;
+}
+
+// Looks up the active primary card for a known patron by playerId.
+// Called at login time: camera stores playerId, CMS may re-issue cards,
+// so we always fetch the current active card rather than storing it at enrolment.
+// Returns the cardId as a string, or empty string on failure.
+std::string cms_lookup_active_card(const CmsConfig& cms, int player_id)
+{
+    char path_buf[256];
+    std::snprintf(path_buf, sizeof(path_buf), cms.card_create_path_template.c_str(), player_id);
+    std::wstring path_w = Utf8ToWide(path_buf);
+
+    std::printf("[CMS] GET cards for playerId=%d  path=%s\n", player_id, path_buf);
+    auto resp = http_get_json(cms, path_w.c_str());
+    std::printf("[CMS] GET cards status=%d body=%.*s\n", resp.status,
+        (int)std::min<size_t>(resp.body.size(), 400), resp.body.c_str());
+
+    if (!resp.ok || resp.status < 200 || resp.status >= 300)
+    {
+        std::printf("[CMS] GET cards FAILED for playerId=%d\n", player_id);
+        return {};
+    }
+
+    try
+    {
+        auto j = nlohmann::json::parse(resp.body);
+        if (!j.is_array() || j.empty())
+        {
+            std::printf("[CMS] GET cards: empty or non-array response\n");
+            return {};
+        }
+
+        // Prefer Active+primary card; fall back to first Active card
+        std::string first_active;
+        for (const auto& card : j)
+        {
+            std::string status   = card.value("status",   "");
+            std::string cardType = card.value("cardType", "");
+            int         cid      = card.value("cardId",   0);
+            if (status != "Active" || cid <= 0) continue;
+            if (cardType == "primary") return std::to_string(cid);
+            if (first_active.empty())  first_active = std::to_string(cid);
+        }
+
+        if (!first_active.empty())
+            std::printf("[CMS] GET cards: no primary card — using first active cardId=%s\n",
+                first_active.c_str());
+        else
+            std::printf("[CMS] GET cards: no active card found for playerId=%d\n", player_id);
+
+        return first_active;
+    }
+    catch (const std::exception& ex)
+    {
+        std::printf("[CMS] GET cards parse error: %s\n", ex.what());
+        return {};
+    }
 }
 
 // ============================================================
@@ -693,21 +812,52 @@ public:
         // ── UNLOCKED + Success ───────────────────────────────────────────────
         if (is_success)
         {
-            session.current_user_id = uid;
-            session.current_card_id = uid; // camera user_id == CMS cardId for auto-enrolled patrons
+            // uid is the playerId stored on the camera at enrolment.
+            // We do NOT store cardId on the camera — instead we look it up
+            // from CMS at login time so re-issued cards are always honoured.
+            session.current_user_id = uid;          // playerId
+            session.current_card_id = "";           // resolved asynchronously below
             session.current_route   = *route_opt;
             session.last_seen_owner = now;
             session.state           = SessionState::LockedToUser;
 
-            std::string  card_id = session.current_card_id;
-            AssetRoute   route   = session.current_route;
-            CmsConfig    cms     = _cfg.cms;
+            std::string seat_id_copy = *resolved_seat;
+            AssetRoute  route        = session.current_route;
+            CmsConfig   cms          = _cfg.cms;
+            int         player_id    = std::atoi(uid.c_str());
 
-            std::printf("[SESSION][%s] Locked: user=%s cardId=%s asset=%s\n",
-                resolved_seat->c_str(), uid.c_str(), card_id.c_str(), route.asset_id.c_str());
+            std::printf("[SESSION][%s] Locked: playerId=%s asset=%s — resolving active card...\n",
+                resolved_seat->c_str(), uid.c_str(), route.asset_id.c_str());
 
-            std::thread([cms, route, card_id]()
-                { egm_login(cms, route, card_id); }).detach();
+            // Resolve cardId and login in a background thread.
+            // The resolved cardId is written back into the session so idle_monitor
+            // can use it for logout.
+            std::thread([cms, route, seat_id_copy, player_id]()
+            {
+                std::string card_id = cms_lookup_active_card(cms, player_id);
+
+                if (card_id.empty())
+                {
+                    std::printf("[SESSION][%s] Card lookup failed for playerId=%d — cannot login\n",
+                        seat_id_copy.c_str(), player_id);
+                    return;
+                }
+
+                // Store resolved cardId so idle_monitor can issue logout later
+                {
+                    std::lock_guard<std::mutex> lk(g_state_mtx);
+                    auto it = g_seat_sessions.find(seat_id_copy);
+                    if (it != g_seat_sessions.end() &&
+                        it->second.state == SessionState::LockedToUser)
+                    {
+                        it->second.current_card_id = card_id;
+                    }
+                }
+
+                std::printf("[SESSION][%s] Resolved: playerId=%d -> cardId=%s — logging in\n",
+                    seat_id_copy.c_str(), player_id, card_id.c_str());
+                egm_login(cms, route, card_id);
+            }).detach();
             return;
         }
 
