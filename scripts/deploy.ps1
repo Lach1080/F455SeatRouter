@@ -42,7 +42,7 @@ Write-Host "[OK] Copied F455SeatRouter.exe"
 # site settings (mode, CMS host/port, paths). Fall back to repo root if absent.
 $ConfigSrc = Join-Path $BuildDir "config.json"
 if (-not (Test-Path $ConfigSrc)) {
-    Write-Warning "Runtime config.json not found at $ConfigSrc — falling back to repo root copy."
+    Write-Warning "Runtime config.json not found at $ConfigSrc - falling back to repo root copy."
     $ConfigSrc = Join-Path $RepoRoot "config.json"
 }
 if (Test-Path $ConfigSrc) {
