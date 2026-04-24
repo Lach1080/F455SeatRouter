@@ -38,12 +38,18 @@ Copy-Item $ExePath $DistDir
 Write-Host "[OK] Copied F455SeatRouter.exe"
 
 # --- Copy config.json ---
-$ConfigSrc = Join-Path $RepoRoot "config.json"
+# Prefer the runtime config (x64\Release\config.json) as it holds the actual
+# site settings (mode, CMS host/port, paths). Fall back to repo root if absent.
+$ConfigSrc = Join-Path $BuildDir "config.json"
+if (-not (Test-Path $ConfigSrc)) {
+    Write-Warning "Runtime config.json not found at $ConfigSrc — falling back to repo root copy."
+    $ConfigSrc = Join-Path $RepoRoot "config.json"
+}
 if (Test-Path $ConfigSrc) {
     Copy-Item $ConfigSrc $DistDir
-    Write-Host "[OK] Copied config.json"
+    Write-Host "[OK] Copied config.json (from $ConfigSrc)"
 } else {
-    Write-Warning "config.json not found at repo root - you must copy it manually."
+    Write-Warning "config.json not found - you must copy it to the dist folder manually."
 }
 
 # --- Copy SDK DLLs ---
