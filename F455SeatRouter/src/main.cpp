@@ -296,6 +296,10 @@ struct SeatSession
     // Table mode: ratingId of the open rating (0 = none).
     // Persisted to ratings_state.json so it survives a crash/restart.
     int rating_id = 0;
+
+    // Table mode: moment the rating was opened — used to calculate actual playTime.
+    // Stored as steady_clock for runtime math; converted to/from Unix epoch for persistence.
+    std::chrono::steady_clock::time_point session_locked_at{};
 };
 
 // One session per enabled seat_id
@@ -1095,12 +1099,13 @@ public:
         // ── UNLOCKED + Success ───────────────────────────────────────────────
         if (is_success)
         {
-            session.current_user_id = uid;   // always the playerId stored on camera
-            session.current_card_id = "";    // slot: resolved async; table: unused
-            session.current_route   = *route_opt;
-            session.last_seen_owner = now;
-            session.state           = SessionState::LockedToUser;
-            session.rating_id       = 0;     // cleared; table login thread will set it
+            session.current_user_id  = uid;   // always the playerId stored on camera
+            session.current_card_id  = "";    // slot: resolved async; table: unused
+            session.current_route    = *route_opt;
+            session.last_seen_owner  = now;
+            session.state            = SessionState::LockedToUser;
+            session.rating_id        = 0;     // cleared; table login thread will set it
+            session.session_locked_at = now;  // start clock for playTime calculation
 
             std::string seat_id_copy = *resolved_seat;
             AssetRoute  route        = session.current_route;
