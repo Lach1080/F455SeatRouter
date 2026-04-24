@@ -57,9 +57,22 @@ struct SeatConfig
 struct AssetRoute
 {
     std::string seat_id;
-    std::string asset_id;
-    std::string login_token_type;
-    std::string login_token_data;
+    std::string asset_id;           // slot mode
+    std::string login_token_type;   // slot mode
+    std::string login_token_data;   // slot mode
+    int         device_id = 0;      // table mode
+    int         game_id   = 0;      // table mode
+};
+
+// ── Application mode ──────────────────────────────────────────────────────
+enum class AppMode { Slot, Table };
+
+// ── Table-game specific global config ─────────────────────────────────────
+struct TableConfig
+{
+    int employee_id   = 0;      // sent in every table login/logout
+    int play_time     = 360;    // seconds, sent in table logout payload
+    int average_wager = 0;      // sent in wagerDetails on table logout
 };
 
 struct CmsConfig
@@ -97,6 +110,9 @@ struct AppConfig
 
     RealSenseID::DeviceConfig::DumpMode dump_mode =
         RealSenseID::DeviceConfig::DumpMode::None;
+
+    AppMode     mode       = AppMode::Slot;
+    TableConfig table_cfg;
 
     CmsConfig           cms;
     EnrollmentDefaults  enrol_defaults;
@@ -167,6 +183,19 @@ AppConfig LoadAppConfig()
         if (j.contains("port"))                              cfg.port = j["port"].get<std::string>();
         if (j.contains("rotation"))                         cfg.rotation  = ParseRotation(j["rotation"].get<std::string>());
         if (j.contains("DumpMode"))                         cfg.dump_mode = ParseDumpMode(j["DumpMode"].get<std::string>());
+        if (j.contains("mode"))
+        {
+            auto m = j["mode"].get<std::string>();
+            cfg.mode = (m == "table") ? AppMode::Table : AppMode::Slot;
+        }
+
+        if (j.contains("table"))
+        {
+            auto& jt = j["table"];
+            if (jt.contains("employee_id"))   cfg.table_cfg.employee_id   = jt["employee_id"].get<int>();
+            if (jt.contains("play_time"))      cfg.table_cfg.play_time      = jt["play_time"].get<int>();
+            if (jt.contains("average_wager")) cfg.table_cfg.average_wager = jt["average_wager"].get<int>();
+        }
         if (j.contains("idle_timeout_s"))                   cfg.idle_timeout_s = j["idle_timeout_s"].get<int>();
         if (j.contains("switch_delay_s"))                   cfg.switch_delay_s = j["switch_delay_s"].get<int>();
         if (j.contains("auto_enrol_min_interval_s"))        cfg.auto_enrol_min_interval_s = j["auto_enrol_min_interval_s"].get<int>();
@@ -220,6 +249,8 @@ AppConfig LoadAppConfig()
                 if (jr.contains("asset_id"))         ar.asset_id         = jr["asset_id"].get<std::string>();
                 if (jr.contains("login_token_type")) ar.login_token_type = jr["login_token_type"].get<std::string>();
                 if (jr.contains("login_token_data")) ar.login_token_data = jr["login_token_data"].get<std::string>();
+                if (jr.contains("device_id"))        ar.device_id        = jr["device_id"].get<int>();
+                if (jr.contains("game_id"))          ar.game_id          = jr["game_id"].get<int>();
                 cfg.routes.push_back(ar);
             }
         }
@@ -261,12 +292,29 @@ struct SeatSession
     // Keeping them separate prevents orphaned SYNKROS records when camera enrol fails/retries.
     std::string pending_enrol_user_id;
     std::string pending_enrol_card_id;  // non-empty = Phase 2 active
+
+    // Table mode: ratingId of the open rating (0 = none).
+    // Persisted to ratings_state.json so it survives a crash/restart.
+    int rating_id = 0;
 };
 
 // One session per enabled seat_id
 std::unordered_map<std::string, SeatSession> g_seat_sessions;
 std::mutex        g_state_mtx;
 std::atomic<bool> g_running{true};
+
+// Set once in main() before any threads start; used by ratings persistence helpers.
+std::wstring g_exe_dir;
+
+// Extracts the trailing integer from a seat_id string.
+// "seat_1" -> 1,  "seat_2" -> 2.  Returns 1 on parse failure.
+static int ExtractSeatNumber(const std::string& seat_id)
+{
+    auto pos = seat_id.rfind('_');
+    if (pos == std::string::npos || pos + 1 >= seat_id.size()) return 1;
+    try { return std::stoi(seat_id.substr(pos + 1)); }
+    catch (...) { return 1; }
+}
 
 // ============================================================
 // HELPERS
@@ -542,6 +590,70 @@ HttpResponse http_get_json(const CmsConfig& cms, const wchar_t* path)
     return result;
 }
 
+HttpResponse http_patch_json(const CmsConfig& cms, const wchar_t* path, const std::string& json_body)
+{
+    using namespace std::chrono;
+    HttpResponse result;
+    if (!init_http(cms)) { std::printf("[HTTP] init_http() failed.\n"); return result; }
+
+    auto t_start = steady_clock::now();
+    HINTERNET h_request = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(g_http_mtx);
+        LPCWSTR headers = L"Content-Type: application/json\r\n";
+
+        h_request = WinHttpOpenRequest(g_http_connect, L"PATCH", path, nullptr,
+            WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+        if (!h_request) goto cleanup_patch;
+
+        if (cms.ignore_cert_errors)
+        {
+            DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+                          SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                          SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+            WinHttpSetOption(h_request, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+        }
+
+        if (!WinHttpSendRequest(h_request, headers, -1L,
+            json_body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)json_body.data(),
+            (DWORD)json_body.size(), (DWORD)json_body.size(), 0)) goto cleanup_patch;
+
+        if (!WinHttpReceiveResponse(h_request, nullptr)) goto cleanup_patch;
+
+        {
+            DWORD sc = 0, sc_sz = sizeof(sc);
+            if (!WinHttpQueryHeaders(h_request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &sc, &sc_sz, WINHTTP_NO_HEADER_INDEX)) goto cleanup_patch;
+            result.status = (int)sc;
+        }
+
+        {
+            std::string body;
+            for (;;)
+            {
+                DWORD avail = 0;
+                if (!WinHttpQueryDataAvailable(h_request, &avail) || avail == 0) break;
+                std::vector<char> buf(avail);
+                DWORD read = 0;
+                if (!WinHttpReadData(h_request, buf.data(), avail, &read) || read == 0) break;
+                body.append(buf.data(), read);
+            }
+            result.body = std::move(body);
+        }
+
+    cleanup_patch:
+        if (h_request) { WinHttpCloseHandle(h_request); }
+    }
+
+    auto ms = duration_cast<milliseconds>(steady_clock::now() - t_start).count();
+    std::printf("[HTTP] PATCH %ls  %ldms  status=%d\n", path, (long)ms, result.status);
+    result.ok = (result.status != 0);
+    return result;
+}
+
 int extract_int_field(const std::string& body, const std::string& field)
 {
     std::string key = "\"" + field + "\":";
@@ -693,6 +805,177 @@ std::string cms_lookup_active_card(const CmsConfig& cms, int player_id)
 }
 
 // ============================================================
+// TABLE GAME LOGIN / LOGOUT
+// ============================================================
+
+struct TableLoginResult { bool ok = false; int rating_id = 0; };
+
+// POST /ssb/v1/ratings/table/  — opens a table rating.
+// Returns the ratingId assigned by SYNKROS (> 0 on success).
+TableLoginResult egm_table_login(const CmsConfig& cms, const AssetRoute& route,
+    const TableConfig& table_cfg, const std::string& player_id, int seat_number)
+{
+    std::string payload =
+        "{\"status\":\"open\""
+        ",\"deviceId\":"    + std::to_string(route.device_id) +
+        ",\"gameId\":"      + std::to_string(route.game_id) +
+        ",\"playerId\":"    + player_id +
+        ",\"seat\":"        + std::to_string(seat_number) +
+        ",\"employeeId\":"  + std::to_string(table_cfg.employee_id) + "}";
+
+    std::wprintf(L"[TABLE] LOGIN  POST %ls:%d%ls\n",
+        cms.host.c_str(), (int)cms.port, cms.path_logins.c_str());
+    std::printf("[TABLE] LOGIN  payload=%s\n", payload.c_str());
+    auto resp = http_post_json(cms, cms.path_logins.c_str(), payload);
+    std::printf("[TABLE] LOGIN  status=%d body=%.*s\n", resp.status,
+        (int)std::min<size_t>(resp.body.size(), 500), resp.body.c_str());
+
+    if (!resp.ok || resp.status < 200 || resp.status >= 300)
+    {
+        std::printf("[TABLE] LOGIN FAILED (HTTP status=%d)\n", resp.status);
+        return {};
+    }
+
+    int rating_id = extract_int_field(resp.body, "ratingId");
+    if (rating_id <= 0)
+    {
+        std::printf("[TABLE] LOGIN ERROR: could not parse ratingId from response\n");
+        return {};
+    }
+
+    std::printf("[TABLE] LOGIN SUCCESS: ratingId=%d playerId=%s seat=%d\n",
+        rating_id, player_id.c_str(), seat_number);
+    return { true, rating_id };
+}
+
+// PATCH /ssb/v1/ratings/table/{ratingId}  — closes the table rating.
+// Verifies "status":"closed" in the response body.
+bool egm_table_logout(const CmsConfig& cms, const AssetRoute& route,
+    const TableConfig& table_cfg, int rating_id)
+{
+    std::string payload =
+        "{\"status\":\"closed\""
+        ",\"gameId\":"      + std::to_string(route.game_id) +
+        ",\"wagerDetails\":[{\"gameId\":" + std::to_string(route.game_id) +
+        ",\"averageWager\":" + std::to_string(table_cfg.average_wager) + "}]"
+        ",\"playTime\":"    + std::to_string(table_cfg.play_time) +
+        ",\"employeeId\":"  + std::to_string(table_cfg.employee_id) + "}";
+
+    // Path: base logouts path + ratingId  (e.g. /ssb/v1/ratings/table/10309404)
+    std::wstring path = cms.path_logouts + std::to_wstring(rating_id);
+
+    std::wprintf(L"[TABLE] LOGOUT PATCH %ls:%d%ls\n",
+        cms.host.c_str(), (int)cms.port, path.c_str());
+    std::printf("[TABLE] LOGOUT payload=%s\n", payload.c_str());
+    auto resp = http_patch_json(cms, path.c_str(), payload);
+    std::printf("[TABLE] LOGOUT status=%d body=%.*s\n", resp.status,
+        (int)std::min<size_t>(resp.body.size(), 500), resp.body.c_str());
+
+    if (!resp.ok || resp.status < 200 || resp.status >= 300)
+    {
+        std::printf("[TABLE] LOGOUT FAILED (HTTP status=%d)\n", resp.status);
+        return false;
+    }
+
+    // Confirm SYNKROS closed the rating
+    bool closed = resp.body.find("\"status\":\"closed\"")  != std::string::npos ||
+                  resp.body.find("\"status\": \"closed\"") != std::string::npos;
+
+    if (closed)
+        std::printf("[TABLE] LOGOUT SUCCESS: ratingId=%d confirmed closed\n", rating_id);
+    else
+        std::printf("[TABLE] LOGOUT WARNING: ratingId=%d response did not confirm closed\n", rating_id);
+
+    return closed;
+}
+
+// ============================================================
+// RATINGS STATE PERSISTENCE
+// Writes/reads ratings_state.json next to the EXE so that open
+// table ratings survive an application crash or restart.
+// ============================================================
+
+// Snapshot all seats with an open rating to disk.
+// Call after every table login and after every successful table logout.
+void save_ratings_state()
+{
+    nlohmann::json j = nlohmann::json::object();
+
+    {
+        std::lock_guard<std::mutex> lock(g_state_mtx);
+        for (const auto& [seat_id, session] : g_seat_sessions)
+        {
+            if (session.rating_id > 0)
+            {
+                j[seat_id] = {
+                    { "rating_id", session.rating_id      },
+                    { "player_id", session.current_user_id }
+                };
+            }
+        }
+    }
+
+    std::wstring path = g_exe_dir + L"\\ratings_state.json";
+    std::ofstream f(path);
+    if (f.is_open())
+    {
+        f << j.dump(2);
+        std::printf("[STATE] ratings_state.json saved (%zu open rating(s))\n",
+            (size_t)j.size());
+    }
+    else
+    {
+        std::printf("[STATE] WARNING: could not write ratings_state.json\n");
+    }
+}
+
+// On startup (table mode only): restore any open ratings from disk.
+// Recovered sessions are put back into LockedToUser state — idle_monitor
+// will close them if the patron doesn't re-present within idle_timeout_s.
+void load_ratings_state()
+{
+    std::wstring path = g_exe_dir + L"\\ratings_state.json";
+    std::ifstream f(path);
+    if (!f.is_open())
+    {
+        std::printf("[STATE] No ratings_state.json found — starting fresh\n");
+        return;
+    }
+
+    try
+    {
+        auto j   = nlohmann::json::parse(f);
+        auto now = std::chrono::steady_clock::now();
+        int  recovered = 0;
+
+        std::lock_guard<std::mutex> lock(g_state_mtx);
+        for (auto& [seat_id, session] : g_seat_sessions)
+        {
+            if (!j.contains(seat_id)) continue;
+            auto& js = j[seat_id];
+
+            int         rid = js.value("rating_id", 0);
+            std::string pid = js.value("player_id", "");
+            if (rid <= 0 || pid.empty()) continue;
+
+            session.rating_id       = rid;
+            session.current_user_id = pid;
+            session.last_seen_owner = now;   // start idle clock from now
+            session.state           = SessionState::LockedToUser;
+            ++recovered;
+
+            std::printf("[STATE][%s] Recovered open rating ratingId=%d playerId=%s\n",
+                seat_id.c_str(), rid, pid.c_str());
+        }
+        std::printf("[STATE] Recovered %d open rating(s) from previous session\n", recovered);
+    }
+    catch (const std::exception& ex)
+    {
+        std::printf("[STATE] WARNING: failed to load ratings_state.json: %s\n", ex.what());
+    }
+}
+
+// ============================================================
 // CALLBACKS
 // ============================================================
 
@@ -812,52 +1095,73 @@ public:
         // ── UNLOCKED + Success ───────────────────────────────────────────────
         if (is_success)
         {
-            // uid is the playerId stored on the camera at enrolment.
-            // We do NOT store cardId on the camera — instead we look it up
-            // from CMS at login time so re-issued cards are always honoured.
-            session.current_user_id = uid;          // playerId
-            session.current_card_id = "";           // resolved asynchronously below
+            session.current_user_id = uid;   // always the playerId stored on camera
+            session.current_card_id = "";    // slot: resolved async; table: unused
             session.current_route   = *route_opt;
             session.last_seen_owner = now;
             session.state           = SessionState::LockedToUser;
+            session.rating_id       = 0;     // cleared; table login thread will set it
 
             std::string seat_id_copy = *resolved_seat;
             AssetRoute  route        = session.current_route;
             CmsConfig   cms          = _cfg.cms;
-            int         player_id    = std::atoi(uid.c_str());
+            int         player_id_i  = std::atoi(uid.c_str());
 
-            std::printf("[SESSION][%s] Locked: playerId=%s asset=%s — resolving active card...\n",
-                resolved_seat->c_str(), uid.c_str(), route.asset_id.c_str());
-
-            // Resolve cardId and login in a background thread.
-            // The resolved cardId is written back into the session so idle_monitor
-            // can use it for logout.
-            std::thread([cms, route, seat_id_copy, player_id]()
+            if (_cfg.mode == AppMode::Slot)
             {
-                std::string card_id = cms_lookup_active_card(cms, player_id);
+                // ── Slot: resolve active cardId from CMS, then login ──────────
+                std::printf("[SESSION][%s] Locked (slot): playerId=%s asset=%s — resolving card...\n",
+                    resolved_seat->c_str(), uid.c_str(), route.asset_id.c_str());
 
-                if (card_id.empty())
+                std::thread([cms, route, seat_id_copy, player_id_i]()
                 {
-                    std::printf("[SESSION][%s] Card lookup failed for playerId=%d — cannot login\n",
-                        seat_id_copy.c_str(), player_id);
-                    return;
-                }
-
-                // Store resolved cardId so idle_monitor can issue logout later
-                {
-                    std::lock_guard<std::mutex> lk(g_state_mtx);
-                    auto it = g_seat_sessions.find(seat_id_copy);
-                    if (it != g_seat_sessions.end() &&
-                        it->second.state == SessionState::LockedToUser)
+                    std::string card_id = cms_lookup_active_card(cms, player_id_i);
+                    if (card_id.empty())
                     {
-                        it->second.current_card_id = card_id;
+                        std::printf("[SESSION][%s] Card lookup failed for playerId=%d — cannot login\n",
+                            seat_id_copy.c_str(), player_id_i);
+                        return;
                     }
-                }
+                    {
+                        std::lock_guard<std::mutex> lk(g_state_mtx);
+                        auto it = g_seat_sessions.find(seat_id_copy);
+                        if (it != g_seat_sessions.end() &&
+                            it->second.state == SessionState::LockedToUser)
+                            it->second.current_card_id = card_id;
+                    }
+                    std::printf("[SESSION][%s] Resolved: playerId=%d -> cardId=%s — logging in\n",
+                        seat_id_copy.c_str(), player_id_i, card_id.c_str());
+                    egm_login(cms, route, card_id);
+                }).detach();
+            }
+            else // AppMode::Table
+            {
+                // ── Table: open a rating directly using playerId ───────────────
+                int         seat_num  = ExtractSeatNumber(seat_id_copy);
+                TableConfig tbl       = _cfg.table_cfg;
 
-                std::printf("[SESSION][%s] Resolved: playerId=%d -> cardId=%s — logging in\n",
-                    seat_id_copy.c_str(), player_id, card_id.c_str());
-                egm_login(cms, route, card_id);
-            }).detach();
+                std::printf("[SESSION][%s] Locked (table): playerId=%s deviceId=%d gameId=%d seat=%d\n",
+                    resolved_seat->c_str(), uid.c_str(),
+                    route.device_id, route.game_id, seat_num);
+
+                std::thread([cms, route, seat_id_copy, uid, seat_num, tbl]()
+                {
+                    auto result = egm_table_login(cms, route, tbl, uid, seat_num);
+                    if (!result.ok)
+                    {
+                        std::printf("[SESSION][%s] Table login FAILED\n", seat_id_copy.c_str());
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(g_state_mtx);
+                        auto it = g_seat_sessions.find(seat_id_copy);
+                        if (it != g_seat_sessions.end() &&
+                            it->second.state == SessionState::LockedToUser)
+                            it->second.rating_id = result.rating_id;
+                    }
+                    save_ratings_state();
+                }).detach();
+            }
             return;
         }
 
@@ -897,24 +1201,56 @@ void idle_monitor(const AppConfig& cfg)
 
             for (auto& [seat_id, session] : g_seat_sessions)
             {
-                if (session.state == SessionState::LockedToUser &&
-                    !session.current_card_id.empty())
+                // Determine if the session is ready for idle-logout monitoring.
+                // Slot mode: wait until cardId is resolved (set by login thread).
+                // Table mode: wait until ratingId is set (set by table login thread).
+                const bool ready =
+                    (session.state == SessionState::LockedToUser) &&
+                    (cfg.mode == AppMode::Slot
+                        ? !session.current_card_id.empty()
+                        : session.rating_id != 0);
+
+                if (ready)
                 {
                     auto elapsed = duration_cast<seconds>(now - session.last_seen_owner).count();
                     if (elapsed >= cfg.idle_timeout_s)
                     {
-                        std::string card_id = session.current_card_id;
-                        AssetRoute  route   = session.current_route;
-                        std::printf("[BG][%s] Idle timeout — logout cardId=%s asset=%s\n",
-                            seat_id.c_str(), card_id.c_str(), route.asset_id.c_str());
+                        AssetRoute  route      = session.current_route;
+                        std::string seat_id_cp = seat_id;
 
-                        session.state = SessionState::Cooldown;
+                        session.state          = SessionState::Cooldown;
                         session.cooldown_until = now + seconds(cfg.switch_delay_s);
                         session.current_user_id.clear();
-                        session.current_card_id.clear();
 
-                        std::thread([cms = cfg.cms, route, card_id]()
-                            { egm_logout(cms, route, card_id); }).detach();
+                        if (cfg.mode == AppMode::Slot)
+                        {
+                            std::string card_id = session.current_card_id;
+                            session.current_card_id.clear();
+
+                            std::printf("[BG][%s] Idle timeout — slot logout cardId=%s\n",
+                                seat_id.c_str(), card_id.c_str());
+
+                            std::thread([cms = cfg.cms, route, card_id]()
+                                { egm_logout(cms, route, card_id); }).detach();
+                        }
+                        else // Table
+                        {
+                            int         rating_id = session.rating_id;
+                            TableConfig tbl       = cfg.table_cfg;
+                            session.rating_id = 0;
+
+                            std::printf("[BG][%s] Idle timeout — table logout ratingId=%d\n",
+                                seat_id.c_str(), rating_id);
+
+                            std::thread([cms = cfg.cms, route, tbl, rating_id, seat_id_cp]()
+                            {
+                                bool ok = egm_table_logout(cms, route, tbl, rating_id);
+                                if (!ok)
+                                    std::printf("[BG][%s] Table logout FAILED for ratingId=%d\n",
+                                        seat_id_cp.c_str(), rating_id);
+                                save_ratings_state(); // clears ratingId from state file
+                            }).detach();
+                        }
                     }
                 }
 
@@ -939,21 +1275,36 @@ int main()
 
     try
     {
+        g_exe_dir = GetExeDir();  // must be set before any thread or persistence call
+
         AppConfig appCfg = LoadAppConfig();
 
         const size_t enabled_count = CountEnabledSeats(appCfg);
-        std::printf("=== F455SeatRouter v2.0 (multi-seat concurrent) ===\n");
-        std::printf("Enabled seats = %zu  |  Port = %s\n", enabled_count, appCfg.port.c_str());
+        std::printf("=== F455SeatRouter v4.0 ===\n");
+        std::printf("Mode = %s  |  Enabled seats = %zu  |  Port = %s\n",
+            appCfg.mode == AppMode::Table ? "TABLE" : "SLOT",
+            enabled_count, appCfg.port.c_str());
 
         for (const auto& seat : appCfg.seats)
             if (seat.enabled)
                 std::printf("  Seat %-8s ROI x=%4u y=%4u w=%4u h=%4u\n",
                     seat.seat_id.c_str(), seat.x, seat.y, seat.width, seat.height);
 
-        for (const auto& route : appCfg.routes)
-            std::printf("  Route %-8s -> asset=%-6s tokenType=%s tokenData=%s\n",
-                route.seat_id.c_str(), route.asset_id.c_str(),
-                route.login_token_type.c_str(), route.login_token_data.c_str());
+        if (appCfg.mode == AppMode::Slot)
+            for (const auto& route : appCfg.routes)
+                std::printf("  Route %-8s -> asset=%-6s tokenType=%s tokenData=%s\n",
+                    route.seat_id.c_str(), route.asset_id.c_str(),
+                    route.login_token_type.c_str(), route.login_token_data.c_str());
+        else
+            for (const auto& route : appCfg.routes)
+                std::printf("  Route %-8s -> deviceId=%-8d gameId=%d\n",
+                    route.seat_id.c_str(), route.device_id, route.game_id);
+
+        if (appCfg.mode == AppMode::Table)
+            std::printf("  Table config: employeeId=%d playTime=%ds averageWager=%d\n",
+                appCfg.table_cfg.employee_id,
+                appCfg.table_cfg.play_time,
+                appCfg.table_cfg.average_wager);
 
         // Initialise per-seat sessions
         {
@@ -962,6 +1313,10 @@ int main()
                 if (seat.enabled)
                     g_seat_sessions[seat.seat_id] = SeatSession{};
         }
+
+        // Restore any open table ratings from the previous session
+        if (appCfg.mode == AppMode::Table)
+            load_ratings_state();
 
         FaceAuthenticator     auth;
         AutoEnrolAuthCallback authCb(appCfg);

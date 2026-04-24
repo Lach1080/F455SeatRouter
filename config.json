@@ -1,41 +1,74 @@
 {
   "port": "COM3",
   "rotation": "Rotation_90_Deg",
+  "DumpMode": "None",
   "idle_timeout_s": 5,
   "switch_delay_s": 15,
   "auto_enrol_min_interval_s": 5,
   "forbidden_causes_logout_when_locked": false,
 
+  "_comment_mode": "Set to 'slot' for EGM/slot machines, or 'table' for table games. All seats use the same mode.",
+  "mode": "slot",
+
   "cms": {
     "host": "10.16.0.12",
     "port": 9001,
     "path_players": "/ssb/v1/players",
-    "path_logins": "/ssb/v1/egm-logins",
+
+    "_comment_slot_paths": "Used in slot mode",
+    "path_logins":  "/ssb/v1/egm-logins",
     "path_logouts": "/ssb/v1/egm-logouts",
+
+    "_comment_table_paths": "Used in table mode — path_logouts is the BASE path; ratingId is appended at runtime",
+    "_table_path_logins":  "/ssb/v1/ratings/table/",
+    "_table_path_logouts": "/ssb/v1/ratings/table/",
+
     "card_create_path_template": "/ssb/v1/players/%d/cards",
     "ignore_cert_errors": true
   },
 
+  "_comment_table": "Required in table mode only. employee_id applies to all calls.",
+  "table": {
+    "employee_id":   10000063,
+    "play_time":     360,
+    "average_wager": 10000000
+  },
+
   "enrollment_defaults": {
-    "first_name": "Guest",
-    "last_name": "Guest",
-    "birth_date": "1980-09-10",
+    "first_name":    "Guest",
+    "last_name":     "Guest",
+    "birth_date":    "1980-09-10",
     "address_line1": "12 Bay Lane",
-    "postal_code": "1001",
-    "country_code": "AU",
-    "player_pin": "1111"
+    "postal_code":   "1001",
+    "country_code":  "AU",
+    "player_pin":    "1111"
   },
 
   "seats": [
     { "seat_id": "seat_1", "enabled": true,  "x":    0, "y": 0, "width": 640, "height": 1080 },
     { "seat_id": "seat_2", "enabled": false, "x":  640, "y": 0, "width": 640, "height": 1080 },
-    { "seat_id": "seat_3", "enabled": true,  "x": 1280, "y": 0, "width": 640, "height": 1080 },
+    { "seat_id": "seat_3", "enabled": false, "x": 1280, "y": 0, "width": 640, "height": 1080 },
     { "seat_id": "seat_4", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 },
     { "seat_id": "seat_5", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 }
   ],
 
+  "_comment_routes_slot": "Slot mode route fields: asset_id, login_token_type, login_token_data",
+  "_comment_routes_table": "Table mode route fields: device_id (int), game_id (int)",
   "routes": [
-    { "seat_id": "seat_1", "asset_id": "8003", "login_token_type": "assetId", "login_token_data": "8003" },
-    { "seat_id": "seat_3", "asset_id": "8004", "login_token_type": "assetId", "login_token_data": "8004" }
+    {
+      "seat_id": "seat_1",
+      "asset_id": "8003", "login_token_type": "assetId", "login_token_data": "8003",
+      "device_id": 10000359, "game_id": 5017
+    },
+    {
+      "seat_id": "seat_2",
+      "asset_id": "8004", "login_token_type": "assetId", "login_token_data": "8004",
+      "device_id": 10000360, "game_id": 5017
+    },
+    {
+      "seat_id": "seat_3",
+      "asset_id": "8005", "login_token_type": "assetId", "login_token_data": "8005",
+      "device_id": 10000361, "game_id": 5017
+    }
   ]
 }
