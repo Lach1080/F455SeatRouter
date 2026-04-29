@@ -21,5 +21,8 @@
     <None Include="..\README.md">
       <Filter>Config</Filter>
     </None>
+    <None Include="..\x64\Release\config.json">
+      <Filter>Config</Filter>
+    </None>
   </ItemGroup>
 </Project>
