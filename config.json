@@ -52,6 +52,20 @@
     { "seat_id": "seat_5", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 }
   ],
 
+  "_comment_cameras": "v5.0+: one entry per physical F455 camera. Each camera owns a subset of seats. If this array is omitted, the app runs in single-camera mode using the top-level 'port' and all enabled seats.",
+  "cameras": [
+    {
+      "camera_id": "cam_1",
+      "port": "COM3",
+      "seats": ["seat_1", "seat_2"]
+    },
+    {
+      "camera_id": "cam_2",
+      "port": "COM4",
+      "seats": ["seat_3", "seat_4", "seat_5"]
+    }
+  ],
+
   "_comment_routes_slot": "Slot mode route fields: asset_id, login_token_type, login_token_data",
   "_comment_routes_table": "Table mode route fields: device_id (int), game_id (int)",
   "routes": [
