@@ -1299,8 +1299,8 @@ public:
         out.resize(n);
         for (unsigned int i = 0; i < n; ++i)
         {
-            std::strncpy(out[i].user_id, id_ptrs[i], RealSenseID::MAX_USERID_LENGTH);
-            out[i].user_id[RealSenseID::MAX_USERID_LENGTH] = '\0';
+            strncpy_s(out[i].user_id, RealSenseID::MAX_USERID_LENGTH + 1,
+                      id_ptrs[i], RealSenseID::MAX_USERID_LENGTH);
             out[i].faceprints = fps[i];
         }
         log_printf("[CAM][%s] Exported %u user faceprint(s)\n", _cam_cfg.camera_id.c_str(), n);
