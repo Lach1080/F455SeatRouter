@@ -20,8 +20,6 @@
 #include <RealSenseID/DeviceConfig.h>
 #include <RealSenseID/Faceprints.h>
 #include <RealSenseID/Status.h>
-#include <RealSenseID/Preview.h>
-
 #include <nlohmann/json.hpp>
 #include <opencv2/opencv.hpp>
 
@@ -937,41 +935,55 @@ std::vector<CameraWorker*> g_camera_workers;
 std::mutex                 g_camera_workers_mtx;
 
 // ============================================================
-// PREVIEW CALLBACK
-// Captures frames from the SDK Preview class.
-// TryGetFrame() is called from the main thread display loop;
-// OnPreviewImageReady() is called from the SDK preview thread.
+// PREVIEW CAPTURE
+// Uses OpenCV VideoCapture to read frames from the F455's UVC
+// (USB video) interface — a separate USB endpoint from the serial
+// authentication channel, so both run simultaneously.
+// A background thread continuously reads frames; TryGetFrame()
+// is called from the main thread display loop to retrieve the latest.
 // ============================================================
 
-class CameraPreviewCallback : public RealSenseID::PreviewImageReadyCallback
+class CameraPreviewCapture
 {
 public:
-    void OnPreviewImageReady(const RealSenseID::Image& image) override
+    // Open the UVC device at `camera_number` and start the capture thread.
+    bool Start(int camera_number, const std::string& camera_id)
     {
-        if (!image.buffer || image.width == 0 || image.height == 0 || image.size == 0)
-            return;
-        std::lock_guard<std::mutex> lk(_mtx);
-        _buf.assign(image.buffer, image.buffer + image.size);
-        _width     = image.width;
-        _height    = image.height;
-        _new_frame = true;
+        _camera_id = camera_id;
+        _cap.open(camera_number, cv::CAP_DSHOW); // DirectShow — native on Windows
+        if (!_cap.isOpened())
+        {
+            log_printf("[PREVIEW][%s] VideoCapture(%d) failed to open — "
+                       "check camera_number in config.json\n",
+                       _camera_id.c_str(), camera_number);
+            return false;
+        }
+        log_printf("[PREVIEW][%s] VideoCapture(%d) opened\n",
+                   _camera_id.c_str(), camera_number);
+        _running = true;
+        _thread  = std::thread(&CameraPreviewCapture::Run, this);
+        return true;
     }
 
-    // Returns true and populates `out` with a BGR Mat (with ROI boxes drawn)
-    // if a new frame is available since the last call. Thread-safe.
+    void Stop()
+    {
+        _running = false;
+        if (_thread.joinable()) _thread.join();
+        _cap.release();
+    }
+
+    // Returns true and fills `out` (BGR Mat with ROI boxes) if a new frame
+    // is available. Called from the main thread — thread-safe.
     bool TryGetFrame(cv::Mat& out,
                      const AppConfig& app_cfg,
                      const CameraConfig& cam_cfg)
     {
         std::lock_guard<std::mutex> lk(_mtx);
-        if (!_new_frame || _buf.empty()) return false;
-        _new_frame = false;
+        if (!_has_frame) return false;
+        _has_frame = false;
+        out = _latest.clone();
 
-        // SDK delivers RGB24; OpenCV imshow expects BGR.
-        cv::Mat rgb(_height, _width, CV_8UC3, _buf.data());
-        cv::cvtColor(rgb, out, cv::COLOR_RGB2BGR);
-
-        // Draw each assigned seat's ROI as a green rectangle with label.
+        // Overlay each seat's ROI as a labelled green rectangle.
         for (const auto& seat_id : cam_cfg.seat_ids)
         {
             for (const auto& seat : app_cfg.seats)
@@ -991,11 +1003,29 @@ public:
     }
 
 private:
-    std::mutex           _mtx;
-    std::vector<uint8_t> _buf;
-    unsigned int         _width     = 0;
-    unsigned int         _height    = 0;
-    bool                 _new_frame = false;
+    void Run()
+    {
+        cv::Mat frame;
+        while (_running)
+        {
+            if (_cap.read(frame) && !frame.empty())
+            {
+                std::lock_guard<std::mutex> lk(_mtx);
+                _latest    = frame.clone();
+                _has_frame = true;
+            }
+            // Small sleep avoids spinning at full CPU when camera delivers ~30fps
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    std::string       _camera_id;
+    cv::VideoCapture  _cap;
+    std::thread       _thread;
+    std::atomic<bool> _running{false};
+    std::mutex        _mtx;
+    cv::Mat           _latest;
+    bool              _has_frame = false;
 };
 
 // ============================================================
@@ -1332,16 +1362,8 @@ public:
     void Start()
     {
         if (_app_cfg.preview_enabled)
-        {
-            RealSenseID::PreviewConfig pcfg;
-            pcfg.cameraNumber = _cam_cfg.camera_number;
-            pcfg.portraitMode = false; // use landscape; ROI coords are in landscape space
-            _preview = std::make_unique<RealSenseID::Preview>(pcfg);
-            bool ok = _preview->StartPreview(_preview_cb);
-            log_printf("[CAM][%s] Preview started (camera_number=%d): %s\n",
-                _cam_cfg.camera_id.c_str(), _cam_cfg.camera_number, ok ? "OK" : "FAILED");
-            if (!ok) _preview.reset();
-        }
+            _preview_cap.Start(_cam_cfg.camera_number, _cam_cfg.camera_id);
+
         _running = true;
         _thread  = std::thread(&CameraWorker::Run, this);
     }
@@ -1349,18 +1371,15 @@ public:
     void Stop()
     {
         _running = false;
-        if (_preview)
-        {
-            _preview->StopPreview();
-            _preview.reset();
-        }
+        if (_app_cfg.preview_enabled)
+            _preview_cap.Stop();
         if (_thread.joinable()) _thread.join();
     }
 
     // Called from the main thread display loop to retrieve the latest preview frame.
     bool TryGetFrame(cv::Mat& out)
     {
-        return _preview_cb.TryGetFrame(out, _app_cfg, _cam_cfg);
+        return _preview_cap.TryGetFrame(out, _app_cfg, _cam_cfg);
     }
 
 private:
@@ -1546,15 +1565,14 @@ private:
         log_printf("[CAM][%s] Auth loop stopped\n", _cam_cfg.camera_id.c_str());
     }
 
-    CameraConfig                          _cam_cfg;
-    const AppConfig&                      _app_cfg;
-    RealSenseID::FaceAuthenticator        _auth;
-    std::thread                           _thread;
-    std::atomic<bool>                     _running{false};
-    std::queue<CrossEnrolJob>             _xq;
-    std::mutex                            _xq_mtx;
-    std::unique_ptr<RealSenseID::Preview> _preview;
-    CameraPreviewCallback                 _preview_cb;
+    CameraConfig                   _cam_cfg;
+    const AppConfig&               _app_cfg;
+    RealSenseID::FaceAuthenticator _auth;
+    std::thread                    _thread;
+    std::atomic<bool>              _running{false};
+    std::queue<CrossEnrolJob>      _xq;
+    std::mutex                     _xq_mtx;
+    CameraPreviewCapture           _preview_cap;
 };
 
 // ============================================================

@@ -63,7 +63,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>winhttp.lib;rsid.lib;opencv_core4.lib;opencv_highgui4.lib;opencv_imgproc4.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>winhttp.lib;rsid.lib;opencv_core4.lib;opencv_highgui4.lib;opencv_imgproc4.lib;opencv_videoio4.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)sdk\lib\x64\Release;C:\vcpkg\installed\x64-windows\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <!-- Copy config.json and SDK DLLs next to the exe after build -->
@@ -86,7 +86,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>winhttp.lib;rsid.lib;opencv_core4d.lib;opencv_highgui4d.lib;opencv_imgproc4d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>winhttp.lib;rsid.lib;opencv_core4d.lib;opencv_highgui4d.lib;opencv_imgproc4d.lib;opencv_videoio4d.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>$(SolutionDir)sdk\lib\x64\Debug;$(SolutionDir)sdk\lib\x64\Release;C:\vcpkg\installed\x64-windows\debug\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
     <PostBuildEvent>
