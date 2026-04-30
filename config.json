@@ -8,13 +8,13 @@
   "forbidden_causes_logout_when_locked": false,
 
   "_comment_preview": "Set to true to open an OpenCV window per camera showing the live feed with ROI boxes overlaid. Requires 'camera_number' in each cameras[] entry when using multiple cameras.",
-  "preview": false,
+  "preview": true,
 
   "_comment_log_to_file": "Set to true to append all console output (with timestamps) to F455SeatRouter.log in the exe folder.",
-  "log_to_file": false,
+  "log_to_file": true,
 
   "_comment_mode": "Set to 'slot' for EGM/slot machines, or 'table' for table games. All seats use the same mode.",
-  "mode": "slot",
+  "mode": "table",
 
   "cms": {
     "host": "10.16.0.12",
@@ -52,8 +52,8 @@
 
   "seats": [
     { "seat_id": "seat_1", "enabled": true,  "x":    0, "y": 0, "width": 640, "height": 1080 },
-    { "seat_id": "seat_2", "enabled": false, "x":  640, "y": 0, "width": 640, "height": 1080 },
-    { "seat_id": "seat_3", "enabled": false, "x": 1280, "y": 0, "width": 640, "height": 1080 },
+    { "seat_id": "seat_2", "enabled": true, "x":  640, "y": 0, "width": 640, "height": 1080 },
+    { "seat_id": "seat_3", "enabled": true, "x": 1280, "y": 0, "width": 640, "height": 1080 },
     { "seat_id": "seat_4", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 },
     { "seat_id": "seat_5", "enabled": false, "x":    0, "y": 0, "width":   0, "height":    0 }
   ],
@@ -62,13 +62,13 @@
   "cameras": [
     {
       "camera_id": "cam_1",
-      "port": "COM3",
+      "port": "COM5",
       "camera_number": 0,
       "seats": ["seat_1", "seat_2"]
     },
     {
       "camera_id": "cam_2",
-      "port": "COM4",
+      "port": "COM6",
       "camera_number": 1,
       "seats": ["seat_3", "seat_4", "seat_5"]
     }
@@ -79,17 +79,17 @@
   "routes": [
     {
       "seat_id": "seat_1",
-      "asset_id": "8003", "login_token_type": "assetId", "login_token_data": "8003",
+      "asset_id": "291", "login_token_type": "assetId", "login_token_data": "291",
       "device_id": 10000359, "game_id": 5017
     },
     {
       "seat_id": "seat_2",
-      "asset_id": "8004", "login_token_type": "assetId", "login_token_data": "8004",
+      "asset_id": "291", "login_token_type": "assetId", "login_token_data": "291",
       "device_id": 10000360, "game_id": 5017
     },
     {
       "seat_id": "seat_3",
-      "asset_id": "8005", "login_token_type": "assetId", "login_token_data": "8005",
+      "asset_id": "291", "login_token_type": "assetId", "login_token_data": "291",
       "device_id": 10000361, "game_id": 5017
     }
   ]
