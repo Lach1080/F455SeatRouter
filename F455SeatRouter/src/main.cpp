@@ -1085,8 +1085,9 @@ public:
                 if (roi.empty()) continue; // ROI entirely outside frame
                 cv::rectangle(out, roi, cv::Scalar(0, 255, 0), 2);
                 // Label position — clamped so text stays inside frame
-                int label_x = std::min(seat.x + 8, out.cols - 120);
-                int label_y = std::max(seat.y + 36, 36);
+                // (avoid std::min/max — windows.h defines them as macros)
+                int label_x = (seat.x + 8 < out.cols - 120) ? seat.x + 8 : out.cols - 120;
+                int label_y = (seat.y + 36 > 36) ? seat.y + 36 : 36;
                 cv::putText(out, seat.seat_id,
                     cv::Point(label_x, label_y),
                     cv::FONT_HERSHEY_SIMPLEX, 1.1,
