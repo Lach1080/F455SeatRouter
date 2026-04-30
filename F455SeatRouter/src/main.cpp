@@ -244,6 +244,9 @@ AppConfig LoadAppConfig()
     std::wstring exe_dir       = GetExeDir();
     std::wstring config_path_w = exe_dir + L"\\config.json";
 
+    // Always print the full path so it is obvious which file the EXE is reading.
+    log_printf("[CONFIG] Reading: %s\\config.json\n", WideToUtf8(exe_dir).c_str());
+
     std::ifstream f(config_path_w);
     if (!f.is_open())
     {
