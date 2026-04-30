@@ -1032,8 +1032,23 @@ public:
                        _camera_id.c_str(), camera_number);
             return false;
         }
-        log_printf("[PREVIEW][%s] VideoCapture(%d) opened\n",
-                   _camera_id.c_str(), camera_number);
+
+        // Request 1920x1080 so ROI coordinates (which are in 1920x1080 space) align correctly.
+        // The camera will use the nearest resolution it supports.
+        _cap.set(cv::CAP_PROP_FRAME_WIDTH,  1920);
+        _cap.set(cv::CAP_PROP_FRAME_HEIGHT, 1080);
+
+        double actual_w = _cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        double actual_h = _cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        log_printf("[PREVIEW][%s] VideoCapture(%d) opened — frame size: %.0fx%.0f\n",
+                   _camera_id.c_str(), camera_number, actual_w, actual_h);
+        if (actual_w < 1920 || actual_h < 1080)
+            log_printf("[PREVIEW][%s] WARNING: camera delivers %.0fx%.0f, not 1920x1080.\n"
+                       "[PREVIEW][%s] ROI boxes may not align. Adjust seat x/y/width/height\n"
+                       "[PREVIEW][%s] in config.json to match this resolution.\n",
+                       _camera_id.c_str(), actual_w, actual_h,
+                       _camera_id.c_str(), _camera_id.c_str());
+
         _running = true;
         _thread  = std::thread(&CameraPreviewCapture::Run, this);
         return true;
@@ -1058,16 +1073,22 @@ public:
         out = _latest.clone();
 
         // Overlay each seat's ROI as a labelled green rectangle.
+        // Clip to frame bounds so cv::rectangle never receives out-of-range coords.
+        const cv::Rect frame_bounds(0, 0, out.cols, out.rows);
         for (const auto& seat_id : cam_cfg.seat_ids)
         {
             for (const auto& seat : app_cfg.seats)
             {
                 if (seat.seat_id != seat_id || !seat.enabled) continue;
                 if (seat.width == 0 || seat.height == 0) continue;
-                cv::Rect roi(seat.x, seat.y, seat.width, seat.height);
+                cv::Rect roi = cv::Rect(seat.x, seat.y, seat.width, seat.height) & frame_bounds;
+                if (roi.empty()) continue; // ROI entirely outside frame
                 cv::rectangle(out, roi, cv::Scalar(0, 255, 0), 2);
+                // Label position — clamped so text stays inside frame
+                int label_x = std::min(seat.x + 8, out.cols - 120);
+                int label_y = std::max(seat.y + 36, 36);
                 cv::putText(out, seat.seat_id,
-                    cv::Point(seat.x + 8, seat.y + 36),
+                    cv::Point(label_x, label_y),
                     cv::FONT_HERSHEY_SIMPLEX, 1.1,
                     cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
                 break;
@@ -1080,10 +1101,17 @@ private:
     void Run()
     {
         cv::Mat frame;
+        bool first = true;
         while (_running)
         {
             if (_cap.read(frame) && !frame.empty())
             {
+                if (first)
+                {
+                    log_printf("[PREVIEW][%s] First frame received: %dx%d\n",
+                               _camera_id.c_str(), frame.cols, frame.rows);
+                    first = false;
+                }
                 std::lock_guard<std::mutex> lk(_mtx);
                 _latest    = frame.clone();
                 _has_frame = true;
