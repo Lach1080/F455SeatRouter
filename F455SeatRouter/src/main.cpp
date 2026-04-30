@@ -27,6 +27,12 @@
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
+// DirectShow device enumeration (for listing camera names at startup)
+#include <dshow.h>
+#pragma comment(lib, "strmiids.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -938,6 +944,71 @@ std::vector<CameraWorker*> g_camera_workers;
 std::mutex                 g_camera_workers_mtx;
 
 // ============================================================
+// CAMERA ENUMERATION
+// Lists all DirectShow video capture devices with their indices.
+// Called at startup when preview is enabled so the correct
+// camera_number can be identified and set in config.json.
+// ============================================================
+
+static void EnumerateCameras()
+{
+    log_printf("[PREVIEW] Enumerating video capture devices (DirectShow):\n");
+
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+
+    ICreateDevEnum* pDevEnum = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_ICreateDevEnum, reinterpret_cast<void**>(&pDevEnum));
+    if (FAILED(hr))
+    {
+        log_printf("[PREVIEW]   (failed to create device enumerator hr=0x%08lx)\n", hr);
+        CoUninitialize();
+        return;
+    }
+
+    IEnumMoniker* pEnum = nullptr;
+    hr = pDevEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &pEnum, 0);
+    pDevEnum->Release();
+
+    if (hr != S_OK || !pEnum)
+    {
+        log_printf("[PREVIEW]   (no video capture devices found)\n");
+        CoUninitialize();
+        return;
+    }
+
+    IMoniker* pMoniker = nullptr;
+    int index = 0;
+    while (pEnum->Next(1, &pMoniker, nullptr) == S_OK)
+    {
+        IPropertyBag* pPropBag = nullptr;
+        hr = pMoniker->BindToStorage(nullptr, nullptr, IID_IPropertyBag,
+                                     reinterpret_cast<void**>(&pPropBag));
+        if (SUCCEEDED(hr))
+        {
+            VARIANT var;
+            VariantInit(&var);
+            if (SUCCEEDED(pPropBag->Read(L"FriendlyName", &var, nullptr)) &&
+                var.vt == VT_BSTR)
+                log_printf("[PREVIEW]   [%d] %s\n", index, WideToUtf8(var.bstrVal).c_str());
+            else
+                log_printf("[PREVIEW]   [%d] (unknown device)\n", index);
+            VariantClear(&var);
+            pPropBag->Release();
+        }
+        pMoniker->Release();
+        ++index;
+    }
+    pEnum->Release();
+
+    if (index == 0)
+        log_printf("[PREVIEW]   (no devices found)\n");
+
+    log_printf("[PREVIEW]   Set 'camera_number' in cameras[] to the index of the F455 above.\n");
+    CoUninitialize();
+}
+
+// ============================================================
 // PREVIEW CAPTURE
 // Uses OpenCV VideoCapture to read frames from the F455's UVC
 // (USB video) interface — a separate USB endpoint from the serial
@@ -1761,13 +1832,15 @@ int main()
 
         if (appCfg.preview_enabled)
         {
+            EnumerateCameras();
+
             int n_auto = 0;
             for (const auto& cam : appCfg.cameras)
                 if (cam.camera_number < 0) ++n_auto;
-            if (n_auto > 1)
-                log_printf("[PREVIEW] WARNING: %d cameras have camera_number=-1 (auto-detect).\n"
-                           "[PREVIEW] With multiple cameras, set 'camera_number' explicitly in\n"
-                           "[PREVIEW] the cameras[] config to avoid both windows showing the same feed.\n", n_auto);
+            if (n_auto > 0)
+                log_printf("[PREVIEW] WARNING: %d camera(s) have camera_number=-1.\n"
+                           "[PREVIEW] Set 'camera_number' in cameras[] to the correct index above.\n",
+                           n_auto);
         }
 
         // Initialise per-seat sessions
