@@ -67,6 +67,23 @@ if (Test-Path $SdkBinDir) {
     Write-Warning "Copy rsid.dll and any required runtime DLLs into the dist folder manually."
 }
 
+# --- Copy OpenCV DLL from vcpkg (required when "preview": true) ---
+$VcpkgBinDir = "C:\vcpkg\installed\x64-windows\bin"
+if (Test-Path $VcpkgBinDir) {
+    # Match release DLLs only (debug builds end in 'd.dll')
+    $OpenCvDlls = Get-ChildItem $VcpkgBinDir -Filter "opencv_world*.dll" |
+                  Where-Object { $_.Name -notmatch "d\.dll$" }
+    foreach ($dll in $OpenCvDlls) {
+        Copy-Item $dll.FullName $DistDir
+        Write-Host "[OK] Copied $($dll.Name)"
+    }
+    if ($OpenCvDlls.Count -eq 0) {
+        Write-Warning "No opencv_world*.dll found in $VcpkgBinDir - preview will not work on target machine."
+    }
+} else {
+    Write-Warning "vcpkg bin dir not found ($VcpkgBinDir) - copy opencv_world*.dll manually if preview is enabled."
+}
+
 # --- Copy any Visual C++ runtime DLLs present in build dir ---
 $RuntimeDlls = @("msvcp140.dll","vcruntime140.dll","vcruntime140_1.dll")
 foreach ($rt in $RuntimeDlls) {

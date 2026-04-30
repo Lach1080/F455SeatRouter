@@ -1,4 +1,4 @@
-// main.cpp  —  v5.0  N-camera concurrent sessions
+// main.cpp  —  v5.1  Preview windows + file logging
 // Multi-ROI, seat-aware RealSense -> SYNKROS CMS bridge with auto-enrol
 //
 // IMPORTANT:
@@ -6,12 +6,13 @@
 // 2) Link winhttp.lib and rsid.lib
 // 3) All runtime config is read from config.json next to the executable.
 //
-// v5.0 changes: N-camera support
-//   Each camera runs its own CameraWorker thread with its own FaceAuthenticator.
-//   On new enrolment, faceprints are exported from the enrolling camera and
-//   queued for import on all other cameras (cross-enrolment, no physical presence).
-//   A patron logged in on camera A is auto-logged-out when they present to camera B.
-//   On startup, all camera DBs are merged so every camera knows every patron.
+// v5.0 changes: N-camera support (CameraWorker per camera, cross-enrolment, startup DB merge)
+// v5.1 changes:
+//   "preview": true  — OpenCV window per camera showing live feed with ROI boxes overlaid.
+//                      Requires "camera_number" in each cameras[] entry when using multiple
+//                      cameras (0-based Windows UVC device index). ESC closes preview & exits.
+//   "log_to_file": true  — Appends all console output to F455SeatRouter.log in the exe folder,
+//                           with a timestamp prefix on each line.
 
 #include <RealSenseID/FaceAuthenticator.h>
 #include <RealSenseID/AuthenticationCallback.h>
@@ -19,8 +20,10 @@
 #include <RealSenseID/DeviceConfig.h>
 #include <RealSenseID/Faceprints.h>
 #include <RealSenseID/Status.h>
+#include <RealSenseID/Preview.h>
 
 #include <nlohmann/json.hpp>
+#include <opencv2/opencv.hpp>
 
 #include <windows.h>
 #include <winhttp.h>
@@ -29,8 +32,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -41,6 +46,55 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+// ============================================================
+// LOGGING
+// ============================================================
+
+static std::ofstream g_log_file;
+static std::mutex    g_log_mutex;
+static bool          g_log_to_file = false;
+
+static void init_logging(const std::wstring& exe_dir, bool enabled)
+{
+    g_log_to_file = enabled;
+    if (!enabled) return;
+    std::wstring path = exe_dir + L"\\F455SeatRouter.log";
+    g_log_file.open(path, std::ios::app);
+    if (!g_log_file.is_open())
+    {
+        std::printf("[LOG] WARNING: Could not open F455SeatRouter.log — file logging disabled.\n");
+        g_log_to_file = false;
+    }
+    else
+        std::printf("[LOG] Logging to F455SeatRouter.log\n");
+}
+
+// Writes to stdout always; also writes with timestamp to log file when enabled.
+static void log_printf(const char* fmt, ...)
+{
+    char buf[2048];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+
+    fputs(buf, stdout);
+    fflush(stdout);
+
+    if (!g_log_to_file) return;
+
+    auto  now   = std::chrono::system_clock::now();
+    auto  t     = std::chrono::system_clock::to_time_t(now);
+    struct tm tm_info{};
+    localtime_s(&tm_info, &t);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm_info);
+
+    std::lock_guard<std::mutex> lk(g_log_mutex);
+    g_log_file << '[' << ts << "] " << buf;
+    g_log_file.flush();
+}
 
 // ============================================================
 // CONFIG STRUCTS
@@ -65,13 +119,17 @@ struct AssetRoute
 
 // Maps one physical camera to the seats it covers.
 // "port" overrides AppConfig::port for this camera.
+// "camera_number" is the Windows UVC device index used by the Preview class.
+//   -1 = auto-detect (only safe when a single camera is connected).
+//   For two cameras, set 0 and 1 explicitly (see docs/two-camera-setup.md).
 // If config.json has no "cameras" array, one CameraConfig is synthesised
 // from AppConfig::port + all enabled seat_ids (backward compat).
 struct CameraConfig
 {
-    std::string              camera_id;  // e.g. "cam_1"
-    std::string              port;       // e.g. "COM5"
-    std::vector<std::string> seat_ids;   // seat_ids this camera covers
+    std::string              camera_id;     // e.g. "cam_1"
+    std::string              port;          // e.g. "COM5"
+    int                      camera_number = -1; // UVC index for Preview (-1 = auto)
+    std::vector<std::string> seat_ids;      // seat_ids this camera covers
 };
 
 enum class AppMode { Slot, Table };
@@ -118,6 +176,9 @@ struct AppConfig
     int  auto_enrol_min_interval_s = 5;
     bool forbidden_causes_logout_when_locked = false;
 
+    bool preview_enabled = false; // "preview": true
+    bool log_to_file     = false; // "log_to_file": true
+
     AppMode     mode      = AppMode::Slot;
     TableConfig table_cfg;
 
@@ -150,6 +211,16 @@ static std::wstring Utf8ToWide(const std::string& s)
     return out;
 }
 
+static std::string WideToUtf8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return {};
+    std::string out(n - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &out[0], n, nullptr, nullptr);
+    return out;
+}
+
 static RealSenseID::DeviceConfig::DumpMode ParseDumpMode(const std::string& s)
 {
     using D = RealSenseID::DeviceConfig::DumpMode;
@@ -178,7 +249,7 @@ AppConfig LoadAppConfig()
     std::ifstream f(config_path_w);
     if (!f.is_open())
     {
-        std::printf("[CONFIG] WARNING: config.json not found next to exe. Using built-in defaults.\n");
+        log_printf("[CONFIG] WARNING: config.json not found next to exe. Using built-in defaults.\n");
         return cfg;
     }
 
@@ -194,6 +265,8 @@ AppConfig LoadAppConfig()
         if (j.contains("auto_enrol_min_interval_s")) cfg.auto_enrol_min_interval_s = j["auto_enrol_min_interval_s"].get<int>();
         if (j.contains("forbidden_causes_logout_when_locked"))
             cfg.forbidden_causes_logout_when_locked = j["forbidden_causes_logout_when_locked"].get<bool>();
+        if (j.contains("preview"))     cfg.preview_enabled = j["preview"].get<bool>();
+        if (j.contains("log_to_file")) cfg.log_to_file     = j["log_to_file"].get<bool>();
         if (j.contains("mode"))
         {
             auto m = j["mode"].get<std::string>();
@@ -268,8 +341,9 @@ AppConfig LoadAppConfig()
             for (const auto& jcam : j["cameras"])
             {
                 CameraConfig cc;
-                if (jcam.contains("camera_id")) cc.camera_id = jcam["camera_id"].get<std::string>();
-                if (jcam.contains("port"))       cc.port      = jcam["port"].get<std::string>();
+                if (jcam.contains("camera_id"))     cc.camera_id     = jcam["camera_id"].get<std::string>();
+                if (jcam.contains("port"))           cc.port          = jcam["port"].get<std::string>();
+                if (jcam.contains("camera_number")) cc.camera_number = jcam["camera_number"].get<int>();
                 if (jcam.contains("seats") && jcam["seats"].is_array())
                     for (const auto& s : jcam["seats"])
                         cc.seat_ids.push_back(s.get<std::string>());
@@ -277,26 +351,29 @@ AppConfig LoadAppConfig()
             }
         }
 
-        // Backward compat: no cameras array → synthesise one from port + all enabled seats
+        // Backward compat: no cameras array -> synthesise one from port + all enabled seats
         if (cfg.cameras.empty())
         {
             CameraConfig cc;
-            cc.camera_id = "cam_1";
-            cc.port      = cfg.port;
+            cc.camera_id     = "cam_1";
+            cc.port          = cfg.port;
+            cc.camera_number = -1;
             for (const auto& seat : cfg.seats)
                 if (seat.enabled) cc.seat_ids.push_back(seat.seat_id);
             cfg.cameras.push_back(cc);
-            std::printf("[CONFIG] No 'cameras' array found — using single-camera mode on %s\n",
+            log_printf("[CONFIG] No 'cameras' array found — using single-camera mode on %s\n",
                 cc.port.c_str());
         }
 
-        std::printf("[CONFIG] Loaded config.json successfully. Cameras=%zu\n",
-            cfg.cameras.size());
+        log_printf("[CONFIG] Loaded config.json. Cameras=%zu preview=%s log_to_file=%s\n",
+            cfg.cameras.size(),
+            cfg.preview_enabled ? "ON" : "OFF",
+            cfg.log_to_file     ? "ON" : "OFF");
     }
     catch (const std::exception& ex)
     {
-        std::printf("[CONFIG] ERROR parsing config.json: %s\n", ex.what());
-        std::printf("[CONFIG] Falling back to built-in defaults.\n");
+        log_printf("[CONFIG] ERROR parsing config.json: %s\n", ex.what());
+        log_printf("[CONFIG] Falling back to built-in defaults.\n");
     }
 
     return cfg;
@@ -476,12 +553,12 @@ bool init_http(const CmsConfig& cms)
 
     if (!g_http_session)
     {
-        g_http_session = WinHttpOpen(L"F455SeatRouter/5.0",
+        g_http_session = WinHttpOpen(L"F455SeatRouter/5.1",
             WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!g_http_session)
         {
-            std::printf("[HTTP] WinHttpOpen failed (err=%lu)\n", GetLastError());
+            log_printf("[HTTP] WinHttpOpen failed (err=%lu)\n", GetLastError());
             return false;
         }
     }
@@ -490,7 +567,7 @@ bool init_http(const CmsConfig& cms)
         g_http_connect = WinHttpConnect(g_http_session, cms.host.c_str(), cms.port, 0);
         if (!g_http_connect)
         {
-            std::printf("[HTTP] WinHttpConnect failed (err=%lu)\n", GetLastError());
+            log_printf("[HTTP] WinHttpConnect failed (err=%lu)\n", GetLastError());
             WinHttpCloseHandle(g_http_session); g_http_session = nullptr;
             return false;
         }
@@ -504,7 +581,7 @@ HttpResponse http_post_json(const CmsConfig& cms, const wchar_t* path, const std
 {
     using namespace std::chrono;
     HttpResponse result;
-    if (!init_http(cms)) { std::printf("[HTTP] init_http() failed.\n"); return result; }
+    if (!init_http(cms)) { log_printf("[HTTP] init_http() failed.\n"); return result; }
     auto t0 = steady_clock::now();
     HINTERNET h = nullptr;
     {
@@ -533,7 +610,7 @@ HttpResponse http_post_json(const CmsConfig& cms, const wchar_t* path, const std
             b.append(buf.data(),rd); } result.body=std::move(b); }
     cleanup_post: if(h) WinHttpCloseHandle(h);
     }
-    std::printf("[HTTP] POST %ls  %ldms  status=%d\n", path,
+    log_printf("[HTTP] POST %s  %ldms  status=%d\n", WideToUtf8(path).c_str(),
         (long)duration_cast<milliseconds>(steady_clock::now()-t0).count(), result.status);
     result.ok = (result.status != 0);
     return result;
@@ -543,7 +620,7 @@ HttpResponse http_get_json(const CmsConfig& cms, const wchar_t* path)
 {
     using namespace std::chrono;
     HttpResponse result;
-    if (!init_http(cms)) { std::printf("[HTTP] init_http() failed.\n"); return result; }
+    if (!init_http(cms)) { log_printf("[HTTP] init_http() failed.\n"); return result; }
     auto t0 = steady_clock::now();
     HINTERNET h = nullptr;
     {
@@ -570,7 +647,7 @@ HttpResponse http_get_json(const CmsConfig& cms, const wchar_t* path)
             b.append(buf.data(),rd); } result.body=std::move(b); }
     cleanup_get: if(h) WinHttpCloseHandle(h);
     }
-    std::printf("[HTTP] GET  %ls  %ldms  status=%d\n", path,
+    log_printf("[HTTP] GET  %s  %ldms  status=%d\n", WideToUtf8(path).c_str(),
         (long)duration_cast<milliseconds>(steady_clock::now()-t0).count(), result.status);
     result.ok = (result.status != 0);
     return result;
@@ -580,7 +657,7 @@ HttpResponse http_patch_json(const CmsConfig& cms, const wchar_t* path, const st
 {
     using namespace std::chrono;
     HttpResponse result;
-    if (!init_http(cms)) { std::printf("[HTTP] init_http() failed.\n"); return result; }
+    if (!init_http(cms)) { log_printf("[HTTP] init_http() failed.\n"); return result; }
     auto t0 = steady_clock::now();
     HINTERNET h = nullptr;
     {
@@ -609,7 +686,7 @@ HttpResponse http_patch_json(const CmsConfig& cms, const wchar_t* path, const st
             b.append(buf.data(),rd); } result.body=std::move(b); }
     cleanup_patch: if(h) WinHttpCloseHandle(h);
     }
-    std::printf("[HTTP] PATCH %ls  %ldms  status=%d\n", path,
+    log_printf("[HTTP] PATCH %s  %ldms  status=%d\n", WideToUtf8(path).c_str(),
         (long)duration_cast<milliseconds>(steady_clock::now()-t0).count(), result.status);
     result.ok = (result.status != 0);
     return result;
@@ -640,10 +717,11 @@ bool egm_login(const CmsConfig& cms, const AssetRoute& route, const std::string&
         "{\"cardId\":\"" + card_id +
         "\",\"loginTokenType\":\"" + route.login_token_type +
         "\",\"loginTokenData\":\"" + route.login_token_data + "\"}";
-    std::wprintf(L"[EGM] LOGIN  %ls:%d%ls\n", cms.host.c_str(),(int)cms.port,cms.path_logins.c_str());
-    std::printf("[EGM] LOGIN  payload=%s\n", payload.c_str());
+    log_printf("[EGM] LOGIN  %s:%d%s\n",
+        WideToUtf8(cms.host).c_str(),(int)cms.port,WideToUtf8(cms.path_logins).c_str());
+    log_printf("[EGM] LOGIN  payload=%s\n", payload.c_str());
     auto resp = http_post_json(cms, cms.path_logins.c_str(), payload);
-    std::printf("[EGM] LOGIN  status=%d body=%.*s\n", resp.status,
+    log_printf("[EGM] LOGIN  status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(),300), resp.body.c_str());
     return resp.ok && resp.status >= 200 && resp.status < 300;
 }
@@ -652,10 +730,11 @@ bool egm_logout(const CmsConfig& cms, const AssetRoute& route, const std::string
 {
     std::string payload =
         "{\"cardId\":\"" + card_id + "\",\"assetId\":\"" + route.asset_id + "\"}";
-    std::wprintf(L"[EGM] LOGOUT %ls:%d%ls\n", cms.host.c_str(),(int)cms.port,cms.path_logouts.c_str());
-    std::printf("[EGM] LOGOUT payload=%s\n", payload.c_str());
+    log_printf("[EGM] LOGOUT %s:%d%s\n",
+        WideToUtf8(cms.host).c_str(),(int)cms.port,WideToUtf8(cms.path_logouts).c_str());
+    log_printf("[EGM] LOGOUT payload=%s\n", payload.c_str());
     auto resp = http_post_json(cms, cms.path_logouts.c_str(), payload);
-    std::printf("[EGM] LOGOUT status=%d body=%.*s\n", resp.status,
+    log_printf("[EGM] LOGOUT status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(),300), resp.body.c_str());
     return resp.ok && resp.status >= 200 && resp.status < 300;
 }
@@ -670,16 +749,16 @@ bool egm_auto_enrol(const AppConfig& cfg, NewPatronInfo& out)
         "\",\"postalCode\":\"" + cfg.enrol_defaults.postal_code +
         "\",\"countryCode\":\"" + cfg.enrol_defaults.country_code + "\"}}";
 
-    std::wprintf(L"[EGM] AUTO-ENROL: POST %ls\n", cfg.cms.path_players.c_str());
+    log_printf("[EGM] AUTO-ENROL: POST %s\n", WideToUtf8(cfg.cms.path_players).c_str());
     auto pr = http_post_json(cfg.cms, cfg.cms.path_players.c_str(), player_payload);
-    std::printf("[EGM] AUTO-ENROL: /players status=%d body=%.*s\n", pr.status,
+    log_printf("[EGM] AUTO-ENROL: /players status=%d body=%.*s\n", pr.status,
         (int)std::min<size_t>(pr.body.size(),300), pr.body.c_str());
     if (!pr.ok || pr.status < 200 || pr.status >= 300)
-        { std::printf("[EGM] AUTO-ENROL ERROR: /players failed.\n"); return false; }
+        { log_printf("[EGM] AUTO-ENROL ERROR: /players failed.\n"); return false; }
 
     int player_id = extract_int_field(pr.body, "playerId");
     if (player_id <= 0)
-        { std::printf("[EGM] AUTO-ENROL ERROR: could not parse playerId.\n"); return false; }
+        { log_printf("[EGM] AUTO-ENROL ERROR: could not parse playerId.\n"); return false; }
 
     char path_buf[256];
     std::snprintf(path_buf, sizeof(path_buf), cfg.cms.card_create_path_template.c_str(), player_id);
@@ -687,18 +766,18 @@ bool egm_auto_enrol(const AppConfig& cfg, NewPatronInfo& out)
 
     std::string card_payload = "{\"playerPin\":\"" + cfg.enrol_defaults.player_pin + "\"}";
     auto cr = http_post_json(cfg.cms, card_path_w.c_str(), card_payload);
-    std::printf("[EGM] AUTO-ENROL: /cards status=%d body=%.*s\n", cr.status,
+    log_printf("[EGM] AUTO-ENROL: /cards status=%d body=%.*s\n", cr.status,
         (int)std::min<size_t>(cr.body.size(),300), cr.body.c_str());
     if (!cr.ok || cr.status < 200 || cr.status >= 300)
-        { std::printf("[EGM] AUTO-ENROL ERROR: /cards failed.\n"); return false; }
+        { log_printf("[EGM] AUTO-ENROL ERROR: /cards failed.\n"); return false; }
 
     int card_id = extract_int_field(cr.body, "cardId");
     if (card_id <= 0)
-        { std::printf("[EGM] AUTO-ENROL ERROR: could not parse cardId.\n"); return false; }
+        { log_printf("[EGM] AUTO-ENROL ERROR: could not parse cardId.\n"); return false; }
 
     out.card_id = std::to_string(card_id);
     out.user_id = std::to_string(player_id); // store playerId on camera
-    std::printf("[EGM] AUTO-ENROL SUCCESS: playerId=%d cardId=%d\n", player_id, card_id);
+    log_printf("[EGM] AUTO-ENROL SUCCESS: playerId=%d cardId=%d\n", player_id, card_id);
     return true;
 }
 
@@ -707,9 +786,9 @@ std::string cms_lookup_active_card(const CmsConfig& cms, int player_id)
     char path_buf[256];
     std::snprintf(path_buf, sizeof(path_buf), cms.card_create_path_template.c_str(), player_id);
     std::wstring path_w = Utf8ToWide(path_buf);
-    std::printf("[CMS] GET cards for playerId=%d\n", player_id);
+    log_printf("[CMS] GET cards for playerId=%d\n", player_id);
     auto resp = http_get_json(cms, path_w.c_str());
-    std::printf("[CMS] GET cards status=%d body=%.*s\n", resp.status,
+    log_printf("[CMS] GET cards status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(),400), resp.body.c_str());
     if (!resp.ok || resp.status < 200 || resp.status >= 300) return {};
     try
@@ -729,7 +808,7 @@ std::string cms_lookup_active_card(const CmsConfig& cms, int player_id)
         return first_active;
     }
     catch (const std::exception& ex)
-    { std::printf("[CMS] GET cards parse error: %s\n", ex.what()); return {}; }
+    { log_printf("[CMS] GET cards parse error: %s\n", ex.what()); return {}; }
 }
 
 // ============================================================
@@ -748,18 +827,18 @@ TableLoginResult egm_table_login(const CmsConfig& cms, const AssetRoute& route,
         ",\"playerId\":"   + player_id +
         ",\"seat\":"       + std::to_string(seat_number) +
         ",\"employeeId\":" + std::to_string(table_cfg.employee_id) + "}";
-    std::wprintf(L"[TABLE] LOGIN  POST %ls:%d%ls\n",
-        cms.host.c_str(),(int)cms.port,cms.path_logins.c_str());
-    std::printf("[TABLE] LOGIN  payload=%s\n", payload.c_str());
+    log_printf("[TABLE] LOGIN  POST %s:%d%s\n",
+        WideToUtf8(cms.host).c_str(),(int)cms.port,WideToUtf8(cms.path_logins).c_str());
+    log_printf("[TABLE] LOGIN  payload=%s\n", payload.c_str());
     auto resp = http_post_json(cms, cms.path_logins.c_str(), payload);
-    std::printf("[TABLE] LOGIN  status=%d body=%.*s\n", resp.status,
+    log_printf("[TABLE] LOGIN  status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(),500), resp.body.c_str());
     if (!resp.ok || resp.status < 200 || resp.status >= 300)
-        { std::printf("[TABLE] LOGIN FAILED (HTTP %d)\n", resp.status); return {}; }
+        { log_printf("[TABLE] LOGIN FAILED (HTTP %d)\n", resp.status); return {}; }
     int rid = extract_int_field(resp.body, "ratingId");
     if (rid <= 0)
-        { std::printf("[TABLE] LOGIN ERROR: could not parse ratingId\n"); return {}; }
-    std::printf("[TABLE] LOGIN SUCCESS: ratingId=%d\n", rid);
+        { log_printf("[TABLE] LOGIN ERROR: could not parse ratingId\n"); return {}; }
+    log_printf("[TABLE] LOGIN SUCCESS: ratingId=%d\n", rid);
     return { true, rid };
 }
 
@@ -774,17 +853,18 @@ bool egm_table_logout(const CmsConfig& cms, const AssetRoute& route,
         ",\"playTime\":"    + std::to_string(table_cfg.play_time) +
         ",\"employeeId\":"  + std::to_string(table_cfg.employee_id) + "}";
     std::wstring path = cms.path_logouts + std::to_wstring(rating_id);
-    std::wprintf(L"[TABLE] LOGOUT PATCH %ls:%d%ls\n", cms.host.c_str(),(int)cms.port,path.c_str());
-    std::printf("[TABLE] LOGOUT payload=%s\n", payload.c_str());
+    log_printf("[TABLE] LOGOUT PATCH %s:%d%s\n",
+        WideToUtf8(cms.host).c_str(),(int)cms.port,WideToUtf8(path).c_str());
+    log_printf("[TABLE] LOGOUT payload=%s\n", payload.c_str());
     auto resp = http_patch_json(cms, path.c_str(), payload);
-    std::printf("[TABLE] LOGOUT status=%d body=%.*s\n", resp.status,
+    log_printf("[TABLE] LOGOUT status=%d body=%.*s\n", resp.status,
         (int)std::min<size_t>(resp.body.size(),500), resp.body.c_str());
     if (!resp.ok || resp.status < 200 || resp.status >= 300)
-        { std::printf("[TABLE] LOGOUT FAILED (HTTP %d)\n", resp.status); return false; }
+        { log_printf("[TABLE] LOGOUT FAILED (HTTP %d)\n", resp.status); return false; }
     bool closed = resp.body.find("\"status\":\"closed\"")  != std::string::npos ||
                   resp.body.find("\"status\": \"closed\"") != std::string::npos;
-    if (closed) std::printf("[TABLE] LOGOUT SUCCESS: ratingId=%d closed\n", rating_id);
-    else        std::printf("[TABLE] LOGOUT WARNING: ratingId=%d not confirmed closed\n", rating_id);
+    if (closed) log_printf("[TABLE] LOGOUT SUCCESS: ratingId=%d closed\n", rating_id);
+    else        log_printf("[TABLE] LOGOUT WARNING: ratingId=%d not confirmed closed\n", rating_id);
     return closed;
 }
 
@@ -805,15 +885,15 @@ void save_ratings_state()
     std::wstring path = g_exe_dir + L"\\ratings_state.json";
     std::ofstream f(path);
     if (f.is_open()) { f << j.dump(2);
-        std::printf("[STATE] ratings_state.json saved (%zu open rating(s))\n",(size_t)j.size()); }
-    else std::printf("[STATE] WARNING: could not write ratings_state.json\n");
+        log_printf("[STATE] ratings_state.json saved (%zu open rating(s))\n",(size_t)j.size()); }
+    else log_printf("[STATE] WARNING: could not write ratings_state.json\n");
 }
 
 void load_ratings_state()
 {
     std::wstring path = g_exe_dir + L"\\ratings_state.json";
     std::ifstream f(path);
-    if (!f.is_open()) { std::printf("[STATE] No ratings_state.json — starting fresh\n"); return; }
+    if (!f.is_open()) { log_printf("[STATE] No ratings_state.json — starting fresh\n"); return; }
     try
     {
         auto j   = nlohmann::json::parse(f);
@@ -831,13 +911,13 @@ void load_ratings_state()
             session.last_seen_owner = now;
             session.state           = SessionState::LockedToUser;
             ++recovered;
-            std::printf("[STATE][%s] Recovered open rating %d playerId=%s\n",
+            log_printf("[STATE][%s] Recovered open rating %d playerId=%s\n",
                 seat_id.c_str(), rid, pid.c_str());
         }
-        std::printf("[STATE] Recovered %d open rating(s)\n", recovered);
+        log_printf("[STATE] Recovered %d open rating(s)\n", recovered);
     }
     catch (const std::exception& ex)
-    { std::printf("[STATE] WARNING: load failed: %s\n", ex.what()); }
+    { log_printf("[STATE] WARNING: load failed: %s\n", ex.what()); }
 }
 
 // ============================================================
@@ -851,10 +931,72 @@ struct CrossEnrolJob
     RealSenseID::UserFaceprints faceprints;
 };
 
-// Forward declaration — BroadcastCrossEnrol is defined after CameraWorker.
+// Forward declaration — used in CameraWorker.
 class CameraWorker;
 std::vector<CameraWorker*> g_camera_workers;
 std::mutex                 g_camera_workers_mtx;
+
+// ============================================================
+// PREVIEW CALLBACK
+// Captures frames from the SDK Preview class.
+// TryGetFrame() is called from the main thread display loop;
+// OnPreviewImageReady() is called from the SDK preview thread.
+// ============================================================
+
+class CameraPreviewCallback : public RealSenseID::PreviewImageReadyCallback
+{
+public:
+    void OnPreviewImageReady(const RealSenseID::Image& image) override
+    {
+        if (!image.buffer || image.width == 0 || image.height == 0 || image.size == 0)
+            return;
+        std::lock_guard<std::mutex> lk(_mtx);
+        _buf.assign(image.buffer, image.buffer + image.size);
+        _width     = image.width;
+        _height    = image.height;
+        _new_frame = true;
+    }
+
+    // Returns true and populates `out` with a BGR Mat (with ROI boxes drawn)
+    // if a new frame is available since the last call. Thread-safe.
+    bool TryGetFrame(cv::Mat& out,
+                     const AppConfig& app_cfg,
+                     const CameraConfig& cam_cfg)
+    {
+        std::lock_guard<std::mutex> lk(_mtx);
+        if (!_new_frame || _buf.empty()) return false;
+        _new_frame = false;
+
+        // SDK delivers RGB24; OpenCV imshow expects BGR.
+        cv::Mat rgb(_height, _width, CV_8UC3, _buf.data());
+        cv::cvtColor(rgb, out, cv::COLOR_RGB2BGR);
+
+        // Draw each assigned seat's ROI as a green rectangle with label.
+        for (const auto& seat_id : cam_cfg.seat_ids)
+        {
+            for (const auto& seat : app_cfg.seats)
+            {
+                if (seat.seat_id != seat_id || !seat.enabled) continue;
+                if (seat.width == 0 || seat.height == 0) continue;
+                cv::Rect roi(seat.x, seat.y, seat.width, seat.height);
+                cv::rectangle(out, roi, cv::Scalar(0, 255, 0), 2);
+                cv::putText(out, seat.seat_id,
+                    cv::Point(seat.x + 8, seat.y + 36),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.1,
+                    cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+                break;
+            }
+        }
+        return true;
+    }
+
+private:
+    std::mutex           _mtx;
+    std::vector<uint8_t> _buf;
+    unsigned int         _width     = 0;
+    unsigned int         _height    = 0;
+    bool                 _new_frame = false;
+};
 
 // ============================================================
 // CALLBACKS
@@ -864,11 +1006,11 @@ class SimpleEnrolCallback : public RealSenseID::EnrollmentCallback
 {
 public:
     void OnResult(RealSenseID::EnrollStatus status) override
-    { std::printf("[ENROL] OnResult: %d\n", (int)status); }
+    { log_printf("[ENROL] OnResult: %d\n", (int)status); }
     void OnProgress(RealSenseID::FacePose pose) override
-    { std::printf("[ENROL] OnProgress: pose=%d\n", (int)pose); }
+    { log_printf("[ENROL] OnProgress: pose=%d\n", (int)pose); }
     void OnHint(RealSenseID::EnrollStatus hint, float cov) override
-    { std::printf("[ENROL] OnHint: %d cov=%.2f\n", (int)hint, (double)cov); }
+    { log_printf("[ENROL] OnHint: %d cov=%.2f\n", (int)hint, (double)cov); }
 };
 
 // Authentication callback — one instance per camera.
@@ -884,13 +1026,13 @@ public:
         std::lock_guard<std::mutex> lk(_face_mtx);
         _result_index = 0;
         _face_seats.clear();
-        std::printf("[FACE][%s] faces=%zu timestamp=%u\n",
+        log_printf("[FACE][%s] faces=%zu timestamp=%u\n",
             _cam_cfg.camera_id.c_str(), faces.size(), timestamp);
         for (size_t i = 0; i < faces.size(); ++i)
         {
             const auto& f = faces[i];
             auto seat = ResolveSeatForFace(f, _cfg, _cam_cfg.seat_ids);
-            std::printf("  Face %zu x=%d y=%d w=%d h=%d center=(%d,%d) -> %s\n",
+            log_printf("  Face %zu x=%d y=%d w=%d h=%d center=(%d,%d) -> %s\n",
                 i, f.x, f.y, f.w, f.h, f.x+f.w/2, f.y+f.h/2,
                 seat.has_value() ? seat->c_str() : "none/ambiguous");
             _face_seats.push_back(seat);
@@ -912,13 +1054,13 @@ public:
             ++_result_index;
         }
 
-        std::printf("[AUTH][%s] OnResult[%zu]: status=%d user_id=%s score=%d seat=%s\n",
+        log_printf("[AUTH][%s] OnResult[%zu]: status=%d user_id=%s score=%d seat=%s\n",
             _cam_cfg.camera_id.c_str(), _result_index-1, (int)status, uid.c_str(), (int)score,
             resolved_seat.has_value() ? resolved_seat->c_str() : "<none>");
 
         if (!resolved_seat.has_value())
         {
-            std::printf("[AUTH][%s] No resolved seat — ignored\n", _cam_cfg.camera_id.c_str());
+            log_printf("[AUTH][%s] No resolved seat — ignored\n", _cam_cfg.camera_id.c_str());
             return;
         }
 
@@ -929,7 +1071,7 @@ public:
         auto route_opt = FindRouteForSeat(_cfg, *resolved_seat);
         if (!route_opt.has_value())
         {
-            std::printf("[AUTH][%s] No route for seat %s — ignored\n",
+            log_printf("[AUTH][%s] No route for seat %s — ignored\n",
                 _cam_cfg.camera_id.c_str(), resolved_seat->c_str());
             return;
         }
@@ -938,19 +1080,19 @@ public:
         std::lock_guard<std::mutex> state_lock(g_state_mtx);
         auto& session = g_seat_sessions[*resolved_seat];
 
-        // ── LOCKED ──────────────────────────────────────────────────────────
+        // -- LOCKED --------------------------------------------------------------
         if (session.state == SessionState::LockedToUser)
         {
             if (is_success && uid == session.current_user_id)
             {
                 session.last_seen_owner = now;
-                std::printf("[SESSION][%s][%s] Owner %s re-confirmed\n",
+                log_printf("[SESSION][%s][%s] Owner %s re-confirmed\n",
                     _cam_cfg.camera_id.c_str(), resolved_seat->c_str(), uid.c_str());
                 return;
             }
             if (is_success)
             {
-                std::printf("[SESSION][%s][%s] Other user %s seen while locked to %s — ignored\n",
+                log_printf("[SESSION][%s][%s] Other user %s seen while locked to %s — ignored\n",
                     _cam_cfg.camera_id.c_str(), resolved_seat->c_str(),
                     uid.c_str(), session.current_user_id.c_str());
                 return;
@@ -959,15 +1101,15 @@ public:
             return;
         }
 
-        // ── COOLDOWN ─────────────────────────────────────────────────────────
+        // -- COOLDOWN ------------------------------------------------------------
         if (session.state == SessionState::Cooldown)
         {
-            std::printf("[SESSION][%s][%s] In cooldown — ignored\n",
+            log_printf("[SESSION][%s][%s] In cooldown — ignored\n",
                 _cam_cfg.camera_id.c_str(), resolved_seat->c_str());
             return;
         }
 
-        // ── UNLOCKED + Success ───────────────────────────────────────────────
+        // -- UNLOCKED + Success --------------------------------------------------
         if (is_success)
         {
             // Check for this patron already logged in on another seat — auto-logout there first.
@@ -977,15 +1119,15 @@ public:
                 if (other_session.state != SessionState::LockedToUser) continue;
                 if (other_session.current_user_id != uid) continue;
 
-                std::printf("[SESSION] Auto-logout: patron %s moving from %s to %s\n",
+                log_printf("[SESSION] Auto-logout: patron %s moving from %s to %s\n",
                     uid.c_str(), other_seat_id.c_str(), resolved_seat->c_str());
 
-                auto old_route   = other_session.current_route;
-                auto old_card    = other_session.current_card_id;
-                auto old_rating  = other_session.rating_id;
-                auto old_mode    = _cfg.mode;
-                auto old_tbl     = _cfg.table_cfg;
-                auto old_cms     = _cfg.cms;
+                auto old_route  = other_session.current_route;
+                auto old_card   = other_session.current_card_id;
+                auto old_rating = other_session.rating_id;
+                auto old_mode   = _cfg.mode;
+                auto old_tbl    = _cfg.table_cfg;
+                auto old_cms    = _cfg.cms;
 
                 other_session.state = SessionState::Unlocked;
                 other_session.current_user_id.clear();
@@ -1001,14 +1143,14 @@ public:
             }
 
             // Lock this seat
-            session.current_user_id  = uid;
-            session.current_card_id  = "";
-            session.current_route    = *route_opt;
-            session.last_seen_owner  = now;
-            session.state            = SessionState::LockedToUser;
-            session.rating_id        = 0;
+            session.current_user_id   = uid;
+            session.current_card_id   = "";
+            session.current_route     = *route_opt;
+            session.last_seen_owner   = now;
+            session.state             = SessionState::LockedToUser;
+            session.rating_id         = 0;
             session.session_locked_at = now;
-            session.camera_id        = _cam_cfg.camera_id;
+            session.camera_id         = _cam_cfg.camera_id;
 
             std::string seat_id_copy = *resolved_seat;
             AssetRoute  route        = session.current_route;
@@ -1017,7 +1159,7 @@ public:
 
             if (_cfg.mode == AppMode::Slot)
             {
-                std::printf("[SESSION][%s][%s] Locked (slot): playerId=%s asset=%s\n",
+                log_printf("[SESSION][%s][%s] Locked (slot): playerId=%s asset=%s\n",
                     _cam_cfg.camera_id.c_str(), resolved_seat->c_str(),
                     uid.c_str(), route.asset_id.c_str());
                 std::thread([cms, route, seat_id_copy, player_id_i]()
@@ -1025,7 +1167,7 @@ public:
                     std::string card_id = cms_lookup_active_card(cms, player_id_i);
                     if (card_id.empty())
                     {
-                        std::printf("[SESSION][%s] Card lookup failed — cannot login\n",
+                        log_printf("[SESSION][%s] Card lookup failed — cannot login\n",
                             seat_id_copy.c_str());
                         return;
                     }
@@ -1036,7 +1178,7 @@ public:
                             it->second.state == SessionState::LockedToUser)
                             it->second.current_card_id = card_id;
                     }
-                    std::printf("[SESSION][%s] Resolved playerId=%d -> cardId=%s\n",
+                    log_printf("[SESSION][%s] Resolved playerId=%d -> cardId=%s\n",
                         seat_id_copy.c_str(), player_id_i, card_id.c_str());
                     egm_login(cms, route, card_id);
                 }).detach();
@@ -1045,7 +1187,7 @@ public:
             {
                 int         seat_num = ExtractSeatNumber(seat_id_copy);
                 TableConfig tbl      = _cfg.table_cfg;
-                std::printf("[SESSION][%s][%s] Locked (table): playerId=%s deviceId=%d seat=%d\n",
+                log_printf("[SESSION][%s][%s] Locked (table): playerId=%s deviceId=%d seat=%d\n",
                     _cam_cfg.camera_id.c_str(), resolved_seat->c_str(),
                     uid.c_str(), route.device_id, seat_num);
                 std::thread([cms, route, seat_id_copy, uid, seat_num, tbl]()
@@ -1053,7 +1195,7 @@ public:
                     auto result = egm_table_login(cms, route, tbl, uid, seat_num);
                     if (!result.ok)
                     {
-                        std::printf("[SESSION][%s] Table login FAILED\n", seat_id_copy.c_str());
+                        log_printf("[SESSION][%s] Table login FAILED\n", seat_id_copy.c_str());
                         return;
                     }
                     {
@@ -1069,18 +1211,18 @@ public:
             return;
         }
 
-        // ── UNLOCKED + Forbidden → queue auto-enrol ──────────────────────────
+        // -- UNLOCKED + Forbidden -> queue auto-enrol ----------------------------
         if (is_forbidden)
         {
             session.pending_auto_enrol = true;
             session.camera_id          = _cam_cfg.camera_id;
-            std::printf("[SESSION][%s][%s] Forbidden -> pending auto-enrol\n",
+            log_printf("[SESSION][%s][%s] Forbidden -> pending auto-enrol\n",
                 _cam_cfg.camera_id.c_str(), resolved_seat->c_str());
         }
     }
 
     void OnHint(RealSenseID::AuthenticateStatus hint, float fs) override
-    { std::printf("[AUTH][%s] OnHint: %d fs=%.2f\n",
+    { log_printf("[AUTH][%s] OnHint: %d fs=%.2f\n",
         _cam_cfg.camera_id.c_str(), (int)hint, (double)fs); }
 
 private:
@@ -1104,11 +1246,11 @@ public:
     CameraWorker(const CameraWorker&)            = delete;
     CameraWorker& operator=(const CameraWorker&) = delete;
 
-    // Connect to camera and apply DeviceConfig (called before Start() and by startup merge)
+    // Connect to camera and apply DeviceConfig (called before Start() and by startup merge).
     bool Connect()
     {
         auto st = _auth.Connect({_cam_cfg.port.c_str()});
-        std::printf("[CAM][%s] Connect status=%d (port=%s)\n",
+        log_printf("[CAM][%s] Connect status=%d (port=%s)\n",
             _cam_cfg.camera_id.c_str(), (int)st, _cam_cfg.port.c_str());
         return st == RealSenseID::Status::Ok;
     }
@@ -1117,7 +1259,7 @@ public:
     {
         auto dcfg = BuildCameraDeviceConfig(_app_cfg, _cam_cfg);
         auto st   = _auth.SetDeviceConfig(dcfg);
-        std::printf("[CAM][%s] SetDeviceConfig status=%d\n",
+        log_printf("[CAM][%s] SetDeviceConfig status=%d\n",
             _cam_cfg.camera_id.c_str(), (int)st);
         return st == RealSenseID::Status::Ok;
     }
@@ -1131,12 +1273,11 @@ public:
         unsigned int n = 0;
         if (_auth.QueryNumberOfUsers(n) != RealSenseID::Status::Ok || n == 0)
         {
-            std::printf("[CAM][%s] GetAllUserFaceprints: %u users\n",
+            log_printf("[CAM][%s] GetAllUserFaceprints: %u users\n",
                 _cam_cfg.camera_id.c_str(), n);
             return true; // empty DB is valid
         }
 
-        // Allocate buffers for user IDs
         std::vector<std::vector<char>> id_bufs(n,
             std::vector<char>(RealSenseID::MAX_USERID_LENGTH + 1, '\0'));
         std::vector<char*> id_ptrs(n);
@@ -1144,14 +1285,14 @@ public:
 
         if (_auth.QueryUserIds(id_ptrs.data(), n) != RealSenseID::Status::Ok)
         {
-            std::printf("[CAM][%s] QueryUserIds failed\n", _cam_cfg.camera_id.c_str());
+            log_printf("[CAM][%s] QueryUserIds failed\n", _cam_cfg.camera_id.c_str());
             return false;
         }
 
         std::vector<RealSenseID::Faceprints> fps(n);
         if (_auth.GetUsersFaceprints(fps.data(), n) != RealSenseID::Status::Ok)
         {
-            std::printf("[CAM][%s] GetUsersFaceprints failed\n", _cam_cfg.camera_id.c_str());
+            log_printf("[CAM][%s] GetUsersFaceprints failed\n", _cam_cfg.camera_id.c_str());
             return false;
         }
 
@@ -1162,7 +1303,7 @@ public:
             out[i].user_id[RealSenseID::MAX_USERID_LENGTH] = '\0';
             out[i].faceprints = fps[i];
         }
-        std::printf("[CAM][%s] Exported %u user faceprint(s)\n", _cam_cfg.camera_id.c_str(), n);
+        log_printf("[CAM][%s] Exported %u user faceprint(s)\n", _cam_cfg.camera_id.c_str(), n);
         return true;
     }
 
@@ -1171,7 +1312,7 @@ public:
     {
         if (fps.empty()) return true;
         auto st = _auth.SetUsersFaceprints(fps.data(), (unsigned int)fps.size());
-        std::printf("[CAM][%s] SetUsersFaceprints(%zu entries) status=%d\n",
+        log_printf("[CAM][%s] SetUsersFaceprints(%zu entries) status=%d\n",
             _cam_cfg.camera_id.c_str(), fps.size(), (int)st);
         return st == RealSenseID::Status::Ok;
     }
@@ -1181,15 +1322,26 @@ public:
     {
         std::lock_guard<std::mutex> lk(_xq_mtx);
         _xq.push(job);
-        std::printf("[CAM][%s] Cross-enrol queued for playerId=%s (queue depth=%zu)\n",
+        log_printf("[CAM][%s] Cross-enrol queued for playerId=%s (queue depth=%zu)\n",
             _cam_cfg.camera_id.c_str(), job.user_id.c_str(), _xq.size());
     }
 
     const std::string& CameraId() const { return _cam_cfg.camera_id; }
 
-    // Start the auth loop thread.
+    // Start preview (if enabled) and the auth loop thread.
     void Start()
     {
+        if (_app_cfg.preview_enabled)
+        {
+            RealSenseID::PreviewConfig pcfg;
+            pcfg.cameraNumber = _cam_cfg.camera_number;
+            pcfg.portraitMode = false; // use landscape; ROI coords are in landscape space
+            _preview = std::make_unique<RealSenseID::Preview>(pcfg);
+            bool ok = _preview->StartPreview(_preview_cb);
+            log_printf("[CAM][%s] Preview started (camera_number=%d): %s\n",
+                _cam_cfg.camera_id.c_str(), _cam_cfg.camera_number, ok ? "OK" : "FAILED");
+            if (!ok) _preview.reset();
+        }
         _running = true;
         _thread  = std::thread(&CameraWorker::Run, this);
     }
@@ -1197,18 +1349,27 @@ public:
     void Stop()
     {
         _running = false;
+        if (_preview)
+        {
+            _preview->StopPreview();
+            _preview.reset();
+        }
         if (_thread.joinable()) _thread.join();
+    }
+
+    // Called from the main thread display loop to retrieve the latest preview frame.
+    bool TryGetFrame(cv::Mat& out)
+    {
+        return _preview_cb.TryGetFrame(out, _app_cfg, _cam_cfg);
     }
 
 private:
     // Drain the cross-enrol queue — called between Authenticate() calls.
-    // Jobs that fail are kept in the queue and retried next cycle.
     void DrainCrossEnrolQueue()
     {
         std::unique_lock<std::mutex> lk(_xq_mtx);
         if (_xq.empty()) return;
 
-        // Move the whole queue out to process without holding the lock
         std::queue<CrossEnrolJob> local;
         std::swap(local, _xq);
         lk.unlock();
@@ -1216,20 +1377,19 @@ private:
         while (!local.empty())
         {
             auto& job = local.front();
-            std::printf("[CAM][%s] Importing cross-enrol for playerId=%s\n",
+            log_printf("[CAM][%s] Importing cross-enrol for playerId=%s\n",
                 _cam_cfg.camera_id.c_str(), job.user_id.c_str());
 
             std::vector<RealSenseID::UserFaceprints> entry = { job.faceprints };
             auto st = _auth.SetUsersFaceprints(entry.data(), 1);
-            std::printf("[CAM][%s] SetUsersFaceprints status=%d\n",
+            log_printf("[CAM][%s] SetUsersFaceprints status=%d\n",
                 _cam_cfg.camera_id.c_str(), (int)st);
 
             if (st != RealSenseID::Status::Ok)
             {
-                // Put failed job back in the main queue for retry next cycle
                 std::lock_guard<std::mutex> re_lk(_xq_mtx);
                 _xq.push(job);
-                std::printf("[CAM][%s] Cross-enrol failed — will retry\n",
+                log_printf("[CAM][%s] Cross-enrol failed — will retry\n",
                     _cam_cfg.camera_id.c_str());
             }
             local.pop();
@@ -1245,25 +1405,25 @@ private:
         for (auto& ufp : all)
             if (std::string(ufp.user_id) == user_id)
                 { out = ufp; return true; }
-        std::printf("[CAM][%s] ExportUserFaceprints: playerId=%s not found\n",
+        log_printf("[CAM][%s] ExportUserFaceprints: playerId=%s not found\n",
             _cam_cfg.camera_id.c_str(), user_id.c_str());
         return false;
     }
 
     void Run()
     {
-        std::printf("[CAM][%s] Auth loop started\n", _cam_cfg.camera_id.c_str());
+        log_printf("[CAM][%s] Auth loop started\n", _cam_cfg.camera_id.c_str());
         CameraAwareAuthCallback cb(_app_cfg, _cam_cfg);
 
         while (_running && g_running)
         {
             auto ast = _auth.Authenticate(cb);
-            std::printf("[CAM][%s] Authenticate() Status=%d\n",
+            log_printf("[CAM][%s] Authenticate() Status=%d\n",
                 _cam_cfg.camera_id.c_str(), (int)ast);
             if (ast != RealSenseID::Status::Ok)
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-            // ── Phase 1: Create SYNKROS records for pending seats ──────────
+            // -- Phase 1: Create SYNKROS records for pending seats ---------------
             {
                 using SeatEnrol = std::pair<std::string, AssetRoute>;
                 std::vector<SeatEnrol> cms_pending;
@@ -1283,7 +1443,7 @@ private:
                                 now - session.last_auto_enrol).count() / 1000.0;
                             if (secs < _app_cfg.auto_enrol_min_interval_s)
                             {
-                                std::printf("[CAM][%s][%s] Throttled (%.1fs ago)\n",
+                                log_printf("[CAM][%s][%s] Throttled (%.1fs ago)\n",
                                     _cam_cfg.camera_id.c_str(), seat_id.c_str(), secs);
                                 session.pending_auto_enrol = false;
                                 continue;
@@ -1299,7 +1459,7 @@ private:
                 }
                 for (auto& [seat_id, route] : cms_pending)
                 {
-                    std::printf("[CAM][%s][%s] Phase 1 — creating CMS records\n",
+                    log_printf("[CAM][%s][%s] Phase 1 — creating CMS records\n",
                         _cam_cfg.camera_id.c_str(), seat_id.c_str());
                     NewPatronInfo info;
                     if (egm_auto_enrol(_app_cfg, info))
@@ -1307,16 +1467,16 @@ private:
                         std::lock_guard<std::mutex> lock(g_state_mtx);
                         g_seat_sessions[seat_id].pending_enrol_user_id = info.user_id;
                         g_seat_sessions[seat_id].pending_enrol_card_id = info.card_id;
-                        std::printf("[CAM][%s][%s] CMS done — cardId=%s camera enrol pending\n",
+                        log_printf("[CAM][%s][%s] CMS done — cardId=%s camera enrol pending\n",
                             _cam_cfg.camera_id.c_str(), seat_id.c_str(), info.card_id.c_str());
                     }
                     else
-                        std::printf("[CAM][%s][%s] Phase 1 FAILED\n",
+                        log_printf("[CAM][%s][%s] Phase 1 FAILED\n",
                             _cam_cfg.camera_id.c_str(), seat_id.c_str());
                 }
             }
 
-            // ── Phase 2: Camera enrolment with per-seat ROI restriction ────
+            // -- Phase 2: Camera enrolment with per-seat ROI restriction ---------
             {
                 using SeatCam = std::tuple<std::string,std::string,std::string>;
                 std::vector<SeatCam> cam_pending;
@@ -1334,7 +1494,7 @@ private:
                 }
                 for (auto& [seat_id, user_id, card_id] : cam_pending)
                 {
-                    std::printf("[CAM][%s][%s] Phase 2 — camera enrol playerId=%s\n",
+                    log_printf("[CAM][%s][%s] Phase 2 — camera enrol playerId=%s\n",
                         _cam_cfg.camera_id.c_str(), seat_id.c_str(), user_id.c_str());
 
                     auto single_cfg = BuildSingleSeatDeviceConfig(_app_cfg, seat_id);
@@ -1342,7 +1502,7 @@ private:
 
                     SimpleEnrolCallback enrolCb;
                     auto est = _auth.Enroll(enrolCb, user_id.c_str());
-                    std::printf("[CAM][%s][%s] Enroll() Status=%d\n",
+                    log_printf("[CAM][%s][%s] Enroll() Status=%d\n",
                         _cam_cfg.camera_id.c_str(), seat_id.c_str(), (int)est);
 
                     // Restore full camera config
@@ -1355,17 +1515,15 @@ private:
                             g_seat_sessions[seat_id].pending_enrol_card_id.clear();
                             g_seat_sessions[seat_id].pending_enrol_user_id.clear();
                         }
-                        std::printf("[CAM][%s][%s] Enrol succeeded — cross-enrolling on other cameras\n",
+                        log_printf("[CAM][%s][%s] Enrol succeeded — cross-enrolling on other cameras\n",
                             _cam_cfg.camera_id.c_str(), seat_id.c_str());
 
-                        // Export faceprints and broadcast to all other cameras
                         RealSenseID::UserFaceprints ufp;
                         if (ExportUserFaceprints(user_id, ufp))
                         {
                             CrossEnrolJob job;
                             job.user_id    = user_id;
                             job.faceprints = ufp;
-                            // BroadcastCrossEnrol is defined below
                             std::lock_guard<std::mutex> wlk(g_camera_workers_mtx);
                             for (auto* w : g_camera_workers)
                                 if (w->CameraId() != _cam_cfg.camera_id)
@@ -1373,28 +1531,30 @@ private:
                         }
                     }
                     else
-                        std::printf("[CAM][%s][%s] Camera enrol failed — retrying next cycle\n",
+                        log_printf("[CAM][%s][%s] Camera enrol failed — retrying next cycle\n",
                             _cam_cfg.camera_id.c_str(), seat_id.c_str());
                 }
             }
 
-            // ── Drain cross-enrol queue ─────────────────────────────────────
+            // -- Drain cross-enrol queue -----------------------------------------
             DrainCrossEnrolQueue();
 
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
 
         _auth.Disconnect();
-        std::printf("[CAM][%s] Auth loop stopped\n", _cam_cfg.camera_id.c_str());
+        log_printf("[CAM][%s] Auth loop stopped\n", _cam_cfg.camera_id.c_str());
     }
 
-    CameraConfig                   _cam_cfg;
-    const AppConfig&               _app_cfg;
-    RealSenseID::FaceAuthenticator _auth;
-    std::thread                    _thread;
-    std::atomic<bool>              _running{false};
-    std::queue<CrossEnrolJob>      _xq;
-    std::mutex                     _xq_mtx;
+    CameraConfig                          _cam_cfg;
+    const AppConfig&                      _app_cfg;
+    RealSenseID::FaceAuthenticator        _auth;
+    std::thread                           _thread;
+    std::atomic<bool>                     _running{false};
+    std::queue<CrossEnrolJob>             _xq;
+    std::mutex                            _xq_mtx;
+    std::unique_ptr<RealSenseID::Preview> _preview;
+    CameraPreviewCallback                 _preview_cb;
 };
 
 // ============================================================
@@ -1404,7 +1564,7 @@ private:
 void idle_monitor(const AppConfig& cfg)
 {
     using namespace std::chrono;
-    std::printf("[BG] Idle monitor started: timeout=%ds cooldown=%ds\n",
+    log_printf("[BG] Idle monitor started: timeout=%ds cooldown=%ds\n",
         cfg.idle_timeout_s, cfg.switch_delay_s);
 
     while (g_running)
@@ -1437,7 +1597,7 @@ void idle_monitor(const AppConfig& cfg)
                         {
                             std::string card_id = session.current_card_id;
                             session.current_card_id.clear();
-                            std::printf("[BG][%s] Idle timeout — slot logout cardId=%s\n",
+                            log_printf("[BG][%s] Idle timeout — slot logout cardId=%s\n",
                                 seat_id.c_str(), card_id.c_str());
                             std::thread([cms=cfg.cms, route, card_id]()
                                 { egm_logout(cms, route, card_id); }).detach();
@@ -1447,12 +1607,12 @@ void idle_monitor(const AppConfig& cfg)
                             int         rid = session.rating_id;
                             TableConfig tbl = cfg.table_cfg;
                             session.rating_id = 0;
-                            std::printf("[BG][%s] Idle timeout — table logout ratingId=%d\n",
+                            log_printf("[BG][%s] Idle timeout — table logout ratingId=%d\n",
                                 seat_id.c_str(), rid);
                             std::thread([cms=cfg.cms, route, tbl, rid, seat_id_cp]()
                             {
                                 bool ok = egm_table_logout(cms, route, tbl, rid);
-                                if (!ok) std::printf("[BG][%s] Table logout FAILED ratingId=%d\n",
+                                if (!ok) log_printf("[BG][%s] Table logout FAILED ratingId=%d\n",
                                     seat_id_cp.c_str(), rid);
                                 save_ratings_state();
                             }).detach();
@@ -1462,7 +1622,7 @@ void idle_monitor(const AppConfig& cfg)
 
                 if (session.state == SessionState::Cooldown && now >= session.cooldown_until)
                 {
-                    std::printf("[BG][%s] Cooldown finished — Unlocked\n", seat_id.c_str());
+                    log_printf("[BG][%s] Cooldown finished — Unlocked\n", seat_id.c_str());
                     session.state = SessionState::Unlocked;
                 }
             }
@@ -1481,16 +1641,15 @@ void StartupDBMerge(std::vector<std::unique_ptr<CameraWorker>>& workers)
 {
     if (workers.size() < 2)
     {
-        std::printf("[MERGE] Single camera — no merge needed\n");
+        log_printf("[MERGE] Single camera — no merge needed\n");
         return;
     }
 
-    std::printf("[MERGE] Starting DB merge across %zu cameras...\n", workers.size());
+    log_printf("[MERGE] Starting DB merge across %zu cameras...\n", workers.size());
 
-    // Collect all faceprints from all cameras
     struct CamDB
     {
-        std::string                             camera_id;
+        std::string                              camera_id;
         std::vector<RealSenseID::UserFaceprints> fps;
     };
     std::vector<CamDB> dbs(workers.size());
@@ -1499,19 +1658,16 @@ void StartupDBMerge(std::vector<std::unique_ptr<CameraWorker>>& workers)
     {
         dbs[i].camera_id = workers[i]->CameraId();
         workers[i]->GetAllUserFaceprints(dbs[i].fps);
-        std::printf("[MERGE][%s] %zu users in DB\n",
+        log_printf("[MERGE][%s] %zu users in DB\n",
             dbs[i].camera_id.c_str(), dbs[i].fps.size());
     }
 
-    // For each camera, find users it is missing and import them
     for (size_t target = 0; target < dbs.size(); ++target)
     {
-        // Build set of user_ids this camera already has
         std::unordered_set<std::string> have;
         for (const auto& ufp : dbs[target].fps)
             have.insert(std::string(ufp.user_id));
 
-        // Collect missing entries from all other cameras
         std::vector<RealSenseID::UserFaceprints> missing;
         for (size_t src = 0; src < dbs.size(); ++src)
         {
@@ -1520,22 +1676,22 @@ void StartupDBMerge(std::vector<std::unique_ptr<CameraWorker>>& workers)
                 if (have.find(std::string(ufp.user_id)) == have.end())
                 {
                     missing.push_back(ufp);
-                    have.insert(std::string(ufp.user_id)); // don't import twice
+                    have.insert(std::string(ufp.user_id));
                 }
         }
 
         if (missing.empty())
         {
-            std::printf("[MERGE][%s] Already up to date\n", dbs[target].camera_id.c_str());
+            log_printf("[MERGE][%s] Already up to date\n", dbs[target].camera_id.c_str());
             continue;
         }
 
-        std::printf("[MERGE][%s] Importing %zu missing user(s)\n",
+        log_printf("[MERGE][%s] Importing %zu missing user(s)\n",
             dbs[target].camera_id.c_str(), missing.size());
         workers[target]->ImportFaceprints(missing);
     }
 
-    std::printf("[MERGE] DB merge complete\n");
+    log_printf("[MERGE] DB merge complete\n");
 }
 
 // ============================================================
@@ -1548,35 +1704,50 @@ int main()
     {
         g_exe_dir = GetExeDir();
 
+        // Load config first (needed for log_to_file flag), then init logging.
         AppConfig appCfg = LoadAppConfig();
+        init_logging(g_exe_dir, appCfg.log_to_file);
 
-        std::printf("=== F455SeatRouter v5.0 ===\n");
-        std::printf("Mode=%s  Cameras=%zu\n",
+        log_printf("=== F455SeatRouter v5.1 ===\n");
+        log_printf("Mode=%s  Cameras=%zu  Preview=%s  Logging=%s\n",
             appCfg.mode == AppMode::Table ? "TABLE" : "SLOT",
-            appCfg.cameras.size());
+            appCfg.cameras.size(),
+            appCfg.preview_enabled ? "ON" : "OFF",
+            appCfg.log_to_file     ? "ON" : "OFF");
 
         for (const auto& cam : appCfg.cameras)
         {
-            std::printf("  Camera %-8s port=%-6s seats=",
-                cam.camera_id.c_str(), cam.port.c_str());
-            for (const auto& s : cam.seat_ids) std::printf("%s ", s.c_str());
-            std::printf("\n");
+            log_printf("  Camera %-8s port=%-6s cam_num=%-3d seats=",
+                cam.camera_id.c_str(), cam.port.c_str(), cam.camera_number);
+            for (const auto& s : cam.seat_ids) log_printf("%s ", s.c_str());
+            log_printf("\n");
         }
 
         if (appCfg.mode == AppMode::Slot)
             for (const auto& r : appCfg.routes)
-                std::printf("  Route %-8s asset=%-6s tokenType=%s\n",
+                log_printf("  Route %-8s asset=%-6s tokenType=%s\n",
                     r.seat_id.c_str(), r.asset_id.c_str(), r.login_token_type.c_str());
         else
             for (const auto& r : appCfg.routes)
-                std::printf("  Route %-8s deviceId=%-8d gameId=%d\n",
+                log_printf("  Route %-8s deviceId=%-8d gameId=%d\n",
                     r.seat_id.c_str(), r.device_id, r.game_id);
 
         if (appCfg.mode == AppMode::Table)
-            std::printf("  Table: employeeId=%d playTime=%ds averageWager=%d\n",
+            log_printf("  Table: employeeId=%d playTime=%ds averageWager=%d\n",
                 appCfg.table_cfg.employee_id,
                 appCfg.table_cfg.play_time,
                 appCfg.table_cfg.average_wager);
+
+        if (appCfg.preview_enabled)
+        {
+            int n_auto = 0;
+            for (const auto& cam : appCfg.cameras)
+                if (cam.camera_number < 0) ++n_auto;
+            if (n_auto > 1)
+                log_printf("[PREVIEW] WARNING: %d cameras have camera_number=-1 (auto-detect).\n"
+                           "[PREVIEW] With multiple cameras, set 'camera_number' explicitly in\n"
+                           "[PREVIEW] the cameras[] config to avoid both windows showing the same feed.\n", n_auto);
+        }
 
         // Initialise per-seat sessions
         {
@@ -1604,9 +1775,9 @@ int main()
             auto w = std::make_unique<CameraWorker>(cam_cfg, appCfg);
             if (!w->Connect() || !w->ApplyDeviceConfig())
             {
-                std::printf("ERROR: Could not connect camera %s on %s\n",
+                log_printf("ERROR: Could not connect camera %s on %s\n",
                     cam_cfg.camera_id.c_str(), cam_cfg.port.c_str());
-                std::printf("Press ENTER to exit.\n"); (void)getchar();
+                log_printf("Press ENTER to exit.\n"); (void)getchar();
                 return 1;
             }
             workers.push_back(std::move(w));
@@ -1625,27 +1796,60 @@ int main()
         // Start idle monitor
         std::thread idleThread(idle_monitor, std::cref(appCfg));
 
-        // Start all camera auth loop threads
-        std::printf("Running. All cameras active.\n");
+        // Start all camera auth loop threads (and preview streams if enabled)
+        log_printf("Running. All cameras active.\n");
+        if (appCfg.preview_enabled)
+            log_printf("[PREVIEW] Press ESC in any preview window to exit.\n");
+
         for (auto& w : workers) w->Start();
 
-        // Wait for console close or Ctrl+C — g_running will be set false externally
-        // For now, block until g_running is cleared (no explicit shutdown key in this version)
-        while (g_running)
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // ── Main loop ──────────────────────────────────────────────────────────
+        // When preview is enabled: drive the OpenCV display loop on the main thread
+        // (imshow/waitKey must be called from the same thread that creates the windows).
+        // When preview is off: simply wait for g_running to be cleared externally.
+
+        if (appCfg.preview_enabled)
+        {
+            // Create a named window for each camera
+            for (auto& w : workers)
+                cv::namedWindow(w->CameraId(), cv::WINDOW_NORMAL);
+
+            while (g_running)
+            {
+                for (auto& w : workers)
+                {
+                    cv::Mat frame;
+                    if (w->TryGetFrame(frame))
+                        cv::imshow(w->CameraId(), frame);
+                }
+                int key = cv::waitKey(33); // ~30fps, processes window events
+                if (key == 27) // ESC
+                {
+                    log_printf("[PREVIEW] ESC pressed — shutting down.\n");
+                    g_running = false;
+                    break;
+                }
+            }
+            cv::destroyAllWindows();
+        }
+        else
+        {
+            while (g_running)
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
 
         // Stop all workers
         for (auto& w : workers) w->Stop();
         idleThread.join();
 
-        std::printf("=== Finished. Press ENTER to exit. ===\n");
+        log_printf("=== Finished. Press ENTER to exit. ===\n");
         (void)getchar();
         return 0;
     }
     catch (const std::exception& ex)
     {
-        std::printf("Unhandled exception: %s\n", ex.what());
-        std::printf("Press ENTER to exit.\n"); (void)getchar();
+        log_printf("Unhandled exception: %s\n", ex.what());
+        log_printf("Press ENTER to exit.\n"); (void)getchar();
         return 1;
     }
 }

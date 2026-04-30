@@ -7,6 +7,12 @@
   "auto_enrol_min_interval_s": 5,
   "forbidden_causes_logout_when_locked": false,
 
+  "_comment_preview": "Set to true to open an OpenCV window per camera showing the live feed with ROI boxes overlaid. Requires 'camera_number' in each cameras[] entry when using multiple cameras.",
+  "preview": false,
+
+  "_comment_log_to_file": "Set to true to append all console output (with timestamps) to F455SeatRouter.log in the exe folder.",
+  "log_to_file": false,
+
   "_comment_mode": "Set to 'slot' for EGM/slot machines, or 'table' for table games. All seats use the same mode.",
   "mode": "slot",
 
@@ -57,11 +63,13 @@
     {
       "camera_id": "cam_1",
       "port": "COM3",
+      "camera_number": 0,
       "seats": ["seat_1", "seat_2"]
     },
     {
       "camera_id": "cam_2",
       "port": "COM4",
+      "camera_number": 1,
       "seats": ["seat_3", "seat_4", "seat_5"]
     }
   ],
